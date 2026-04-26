@@ -53,6 +53,34 @@ Markdown Reader 是一款强大的浏览器扩展程序，能让你在浏览器�
 
 3. 进入 Chrome 的扩展管理页，将扩展程序拖拽进浏览器即可安装。
 
+### C. Web 服务部署
+
+除了作为浏览器扩展外，md-reader 还可以作为独立的 Web 服务进行部署。这允许您在不安装扩展的情况下，通过服务器上的 URL 直接查看 Markdown 文件。
+
+1. 克隆 `md-reader` 仓库并安装依赖项：
+
+   ```bash
+   # 克隆此仓库
+   git clone https://github.com/md-reader/md-reader.git && cd md-reader
+
+   # 安装依赖项
+   pnpm install
+   ```
+
+2. 构建应用程序的 Web 版本：
+
+   ```bash
+   npm run build:web
+   ```
+
+3. 启动本地服务器：
+
+   ```bash
+   npm run serve:web
+   ```
+
+4. 服务器默认在 `3000` 端口启动。您可以通过访问 `http://localhost:3000/README-cn.md` 进行测试。
+
 ## 使用
 
 以 Chrome 为例：

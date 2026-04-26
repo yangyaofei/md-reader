@@ -53,6 +53,34 @@ Chrome의 예:
 
 3. Chrome의 확장 프로그램 관리 페이지로 이동하여 확장 프로그램을 브라우저에 드래그하여 설치하세요.
 
+### C. 웹 서비스 배포
+
+브라우저 확장 프로그램 외에도 md-reader는 독립 실행형 웹 서비스로 배포할 수 있습니다. 이를 통해 확장 프로그램을 설치하지 않고도 서버의 URL을 통해 Markdown 파일을 직접 볼 수 있습니다.
+
+1. `md-reader` 리포지토리를 복제하고 종속성을 설치합니다.
+
+   ```bash
+   # 이 리포지토리 복제
+   git clone https://github.com/md-reader/md-reader.git && cd md-reader
+
+   # 종속성 설치
+   pnpm install
+   ```
+
+2. 애플리케이션의 웹 버전을 빌드합니다.
+
+   ```bash
+   npm run build:web
+   ```
+
+3. 로컬 서버를 시작합니다.
+
+   ```bash
+   npm run serve:web
+   ```
+
+4. 서버는 기본적으로 `3000` 포트에서 시작됩니다. `http://localhost:3000/README-ko.md`를 방문하여 테스트할 수 있습니다.
+
 ## 사용법
 
 Chrome의 예:
