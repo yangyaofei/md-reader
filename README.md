@@ -12,7 +12,7 @@ Markdown Reader is a powerful browser extension that enables you to conveniently
 
 > This repository contains the old source code of Markdown Reader(2.x version) and is no longer maintained.
 > It is used only to collect issues about Markdown Reader.
-> 
+>
 > Please download the 3.x version from the [website](https://md-reader.github.io).
 
 - **Document Formats**: Preview links in `file://`, `http://`, `https://` and files with `.md`, `.mkd`, `.mdx`, `.markdown` extensions:
@@ -57,6 +57,34 @@ Example of Chrome:
 2. After a successful build, the `md-reader/dist` folder will contain the `md-reader-xxx.zip` extension package.
 
 3. Go to the Extensions management page in Chrome and drag the extension into the browser to install it.
+
+### C. Web Service Deployment
+
+In addition to being a browser extension, md-reader can also be deployed as a standalone web service. This allows you to view Markdown files directly through a URL on your server without installing the extension.
+
+1. Clone the `md-reader` repository and install dependencies:
+
+   ```bash
+   # Clone this repository
+   git clone https://github.com/md-reader/md-reader.git && cd md-reader
+
+   # Install dependencies
+   pnpm install
+   ```
+
+2. Build the web version of the application:
+
+   ```bash
+   npm run build:web
+   ```
+
+3. Start the local server:
+
+   ```bash
+   npm run serve:web
+   ```
+
+4. The server will start on port `3000` by default. You can test it by visiting: `http://localhost:3000/README.md`.
 
 ## Usage
 
