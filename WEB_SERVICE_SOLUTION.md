@@ -1,73 +1,50 @@
-# 将 md-reader 作为 Web 服务的架构方案（纯前端渲染，Web 服务托管）
+# 将 md-reader 改造为基于 Web 服务的 Markdown 渲染器
 
-根据需求，核心目标是**使用前端渲染（保持现有交互和渲染逻辑），并将 Markdown 文件和所有的静态资源（JS/CSS）从服务器加载，而不是以 Chrome 插件的形式运行**。
+根据需求：需要实现直接访问类似 `http://web-server/something.md` 就能看到渲染后的 Markdown。具体实现方式依然是**前端渲染**。Web Server 的职责是：
+1. 拦截对 `*.md` 的访问，返回一个包含公用渲染脚本的骨架 HTML 页面。
+2. 该 HTML 页面加载后，其内置的 JavaScript 逻辑去拉取真实的原始 Markdown 数据（例如从 `http://web-server/raw/something.md`），并使用现有的 `markdown-it` 逻辑在前端进行渲染。
+3. 托管 `md-reader` 所需的所有打包后的公共静态资源（JS/CSS）。
 
-`md-reader` 原本是一个 Chrome 扩展，其主要逻辑（`src/main.ts`）依赖于监听当前页面的 `document.contentType` 以及通过 `getRawContainer` 获取页面的原始 Markdown 文本（浏览器直接打开 `.md` 时的文本节点）。
+## 1. 核心架构与请求流程
 
-要将其改造为一个普通的 Web 服务，我们需要提供一个静态 HTML 页面作为入口。这个页面会加载改写后的前端 JS 脚本，由前端去服务器请求 Markdown 文本（或者由服务器模板注入文本），然后再在浏览器端执行同样的 Markdown-It 渲染过程。
+**举例：用户访问 `http://web-server/docs/api.md`**
 
-## 1. 核心思路
+1. **浏览器发送请求**：GET `/docs/api.md`
+2. **Web Server 拦截**：Nginx 或 Node.js 检测到这是一个针对 `.md` 文件的请求。它**不返回**纯文本，而是返回一个通用的 `index.html` 骨架页面。
+3. **加载公共资源**：浏览器解析 `index.html`，加载 `@md-reader/theme` 的 CSS 和我们用 Webpack 打包好的核心渲染脚本 `web-main.js`。
+4. **前端发起数据请求**：`web-main.js` 执行。它获取当前页面的 URL 路径（即 `/docs/api.md`），将请求路径改写为指向真实文件内容的接口（例如加上前缀：`/raw/docs/api.md`），并使用 `fetch()` 发起获取原始内容的请求。
+5. **前端渲染**：获取到 Markdown 纯文本后，复用原 Chrome 插件的 `src/core/markdown.ts` 逻辑，将其转换为 HTML，并挂载到页面 DOM 中，生成侧边栏等组件。
 
-1.  **构建静态托管服务**：使用 Express、Nginx 或类似服务器提供 Web 服务。该服务将托管修改后的 `md-reader` 静态资源（HTML、JS、CSS）。
-2.  **修改入口 HTML**：不再依赖 Chrome 扩展的注入，而是提供一个标准的 `index.html`。页面中包含用于挂载内容的节点和引用打包后 JS/CSS 的 `<script>` 与 `<link>` 标签。
-3.  **适配数据获取方式**：在原本的扩展中，Markdown 文本是从浏览器直接展示的 `body > pre` 中获取的（`getRawContainer`）。在 Web 服务模式下，我们需要让前端 JS 通过 `fetch` 或者 URL 参数请求后端的 Markdown 文件并加载内容。
-4.  **移除扩展 API 依赖**：移除 `chrome.runtime.sendMessage` 和 `chrome.runtime.onMessage` 等 Chrome API 调用，改用纯前端的事件或状态管理。
+## 2. 改造步骤与示例
 
-## 2. 改造步骤
+### 第一步：修改打包配置生成公用 JS
 
-### 第一步：修改打包配置以构建 Web 版本
+我们需要将依赖 Chrome 扩展环境的 `main.ts` 改造成纯 Web 逻辑的 `web-main.ts`，并修改 Webpack 配置。
 
-修改 `webpack.common.js` 和打包脚本。原项目将入口打包为 `content.js`、`background.js` 等，这是典型的扩展结构。我们需要为其添加一个 Web 专用入口，并借助 `HtmlWebpackPlugin` 生成 HTML。
+修改 `build/webpack.common.js` 或创建一个针对 Web 的配置 `build/webpack.web.js`：
 
 ```javascript
-// build/webpack.web.js (新建)
+// build/webpack.web.js
 const { resolve } = require('path')
 const { merge } = require('webpack-merge')
 const common = require('./webpack.common.js')
-const HtmlWebpackPlugin = require('html-webpack-plugin')
 
 module.exports = merge(common, {
   entry: {
-    app: resolve(__dirname, '../src/web-main.ts'), // 新的 Web 入口
+    app: resolve(__dirname, '../src/web-main.ts'), // 新的 Web 端入口
   },
-  // 覆盖 output 等配置，不再输出到 extension，而是输出到 dist
   output: {
-    filename: 'js/[name].js',
+    filename: 'js/web-main.js',
     path: resolve(__dirname, '../dist'),
-    publicPath: '/'
-  },
-  plugins: [
-    new HtmlWebpackPlugin({
-      template: resolve(__dirname, '../public/index.html'),
-      filename: 'index.html'
-    })
-  ]
+    publicPath: '/' // 确保嵌套路由下能够正确加载根目录的 JS
+  }
+  // 移除 CopyWebpackPlugin 中处理 manifest.json 和扩展页面的逻辑
 })
 ```
 
-### 第二步：创建 HTML 模板
+### 第二步：编写纯 Web 端的渲染入口
 
-在 `public/index.html` 中提供基础骨架：
-
-```html
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <title>Markdown Reader Web</title>
-  <!-- 主题依赖 -->
-  <link rel="stylesheet" href="https://unpkg.com/@md-reader/theme/dist/index.css">
-</head>
-<body class="md-reader" data-theme="light">
-  <!-- 用于存放通过 AJAX 获取的原始 Markdown 的容器 -->
-  <pre id="raw-markdown-container" style="display: none;"></pre>
-</body>
-</html>
-```
-
-### 第三步：适配前端主逻辑（`src/web-main.ts`）
-
-我们需要基于 `src/main.ts` 创建一个 `web-main.ts`，去除 Chrome API 依赖，并加入网络请求获取 `.md` 文件的逻辑。
+创建 `src/web-main.ts`。在这个文件里，我们需要获取当前 URL 对应的 Markdown 原始文本，并进行渲染。
 
 ```typescript
 import Event from '@/core/event'
@@ -80,29 +57,39 @@ import { mdRender } from '@/core/markdown'
 import { getHeads, setTheme, toTheme } from '@/shared'
 import '@/style/index.less'
 
-// 1. 获取要渲染的 Markdown 文件 URL (可通过查询参数传递，例如 /?file=example.md)
-const urlParams = new URLSearchParams(window.location.search);
-const fileUrl = urlParams.get('file') || '/example.md'; // 默认文件
-
 async function initWebApp() {
-  const configData = getDefaultData({}); // 使用默认配置，因为没有 storage 了
+  const configData = getDefaultData({}); // 使用默认配置
   let mdRaw = '';
 
-  try {
-    // 2. 通过 fetch 从服务器获取 Markdown 内容
-    const response = await fetch(fileUrl);
-    if (!response.ok) throw new Error('File not found');
-    mdRaw = await response.text();
-  } catch (e) {
-    document.body.innerHTML = '<h1>Markdown file load failed.</h1>';
+  // 核心逻辑：获取当前访问的路径，例如 /docs/api.md
+  const currentPath = window.location.pathname;
+
+  // 如果访问的不是以 .md 结尾，或者根路径，这里可以做默认处理
+  if (!currentPath.endsWith('.md')) {
+    document.body.innerHTML = '<h1>请访问具体的 .md 文件</h1>';
     return;
   }
 
-  // 3. 将内容存入 raw container 适配旧逻辑
-  const rawContainer = document.getElementById('raw-markdown-container');
-  if (rawContainer) rawContainer.textContent = mdRaw;
+  // 拼接获取原始文件的 URL。例如后端将原始文件暴露在 /raw/docs/api.md
+  const rawFileUrl = `/raw${currentPath}`;
 
-  // 4. 复用 md-reader 原本的初始化和渲染流程
+  try {
+    const response = await fetch(rawFileUrl);
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    mdRaw = await response.text();
+  } catch (e) {
+    document.body.innerHTML = `<h1>Markdown file load failed.</h1><p>${e.message}</p>`;
+    return;
+  }
+
+  // 构建一个隐藏的原始文本容器，兼容 md-reader 原有生命周期逻辑
+  const rawContainer = document.createElement('pre');
+  rawContainer.id = 'raw-markdown-container';
+  rawContainer.style.display = 'none';
+  rawContainer.textContent = mdRaw;
+  document.body.appendChild(rawContainer);
+
+  // === 以下逻辑复用原 src/main.ts 的渲染流程 ===
   let globalEvent = new Event();
   initPlugins({ event: globalEvent });
   setTheme(configData.pageTheme);
@@ -123,47 +110,109 @@ async function initWebApp() {
   const mdBody = new Ele<HTMLElement>('main', { className: className.MD_BODY }, mdContent);
   const mdSide = new Ele<HTMLElement>('ul', { className: className.MD_SIDE });
 
-  // 渲染侧边栏 TOC (省略具体细节，直接复用原版 renderSide 的实现)
-  // renderSide();
+  // (侧边栏和其它交互的初始化按需接入)
 
-  // 挂载到 body
   lifecycle.mount([mdBody, mdSide]);
 }
 
 initWebApp();
 ```
 
-### 第四步：部署一个简单的静态 Web Server
+### 第三步：设计通用骨架 HTML
 
-项目打包生成 `dist/` 目录后，里面包含了 `index.html` 以及编译后的前端渲染脚本。
+创建一个基础的 HTML 模板 `index.html`。无论用户访问哪一级的目录（如 `/a.md` 或 `/foo/bar/b.md`），服务器都会返回这个页面。
 
-我们只需要使用一个最简单的 Web 服务器即可托管它，并将 Markdown 文件和这些静态资源放在一起。
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Markdown Reader</title>
+  <!-- 引入主题样式 -->
+  <link rel="stylesheet" href="https://unpkg.com/@md-reader/theme/dist/index.css">
+</head>
+<body class="md-reader" data-theme="light">
+  <!-- web-main.js 会在这里动态注入渲染后的 DOM -->
+  <!-- 注意路径使用绝对路径 /js/web-main.js，保证在多级路由下加载正常 -->
+  <script src="/js/web-main.js"></script>
+</body>
+</html>
+```
 
-使用 Express 搭建示例：
+### 第四步：配置 Web Server 的路由重写规则
+
+我们需要服务器做两件事：
+1. 托管静态的 JS、CSS 和公共 HTML。
+2. 将所有 `*.md` 的访问请求指向 `index.html`，同时暴露一个 `/raw/*` 路径供前端下载真实的 `.md` 文件。
+
+**以 Node.js (Express) 为例：**
 
 ```javascript
-// server/index.js
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
+
 const app = express();
+const MARKDOWN_DIR = path.join(__dirname, '../markdown_files'); // 真实MD文件存放的目录
+const PUBLIC_DIR = path.join(__dirname, '../dist'); // 前端打包输出目录，包含 index.html 和 js/web-main.js
 
-// 1. 静态托管前端打包好的 js、css 和 index.html
-app.use(express.static(path.join(__dirname, '../dist')));
+// 1. 静态托管公共 JS 和 CSS
+app.use(express.static(PUBLIC_DIR));
 
-// 2. 静态托管 Markdown 文件存放目录，允许前端 fetch 这些文件
-app.use('/files', express.static(path.join(__dirname, '../markdown_files')));
+// 2. 暴露真实的 Markdown 文件内容接口
+//当前端请求 /raw/something.md 时，返回真实的 something.md 文本
+app.use('/raw', express.static(MARKDOWN_DIR));
 
-// 例如：访问 http://localhost:3000/?file=/files/doc.md
-// 前端 web-main.js 就会 fetch /files/doc.md 并进行前端渲染
+// 3. 拦截所有的 .md 请求，返回通用的 index.html 进行前端渲染
+app.get('/*.md', (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+});
+
+// 处理其他未匹配情况
+app.get('*', (req, res) => {
+  res.send('Welcome to Markdown Web Reader. Please navigate to a .md file.');
+});
 
 app.listen(3000, () => {
-  console.log('Web server is running on http://localhost:3000');
+  console.log('Markdown Web Server listening on port 3000');
 });
+```
+
+**以 Nginx 为例：**
+
+如果使用 Nginx 部署，配置如下：
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+
+    # 根目录指向前端打包输出目录
+    root /path/to/your/dist;
+
+    # 1. 处理前端打包的静态资源
+    location /js/ {
+        try_files $uri =404;
+    }
+
+    # 2. 暴露真实的文件接口
+    location /raw/ {
+        alias /path/to/your/markdown_files/;
+        default_type text/plain;
+    }
+
+    # 3. 拦截所有的 .md 请求并返回 index.html
+    location ~ \.md$ {
+        try_files /index.html =404;
+    }
+}
 ```
 
 ## 总结
 
-这种方案下，**渲染依然发生在浏览器端**，原有的交互（点击复制代码、侧边栏跳转、代码高亮等）能够100%保留。我们所做的仅仅是：
-1. 取消了 Chrome 扩展的打包形式和 API 调用。
-2. 将 `md-reader` 的所有前端逻辑打包成标准的网页 JS 资源。
-3. 利用普通的 Web 服务器托管这些 JS 资源和 Markdown 文本，前端通过 AJAX 拉取文本后执行原本的渲染流程。
+按照上述架构，用户访问 `http://web-server/guide/setup.md` 时：
+1. 服务器响应 `index.html`。
+2. 浏览器加载并执行 `/js/web-main.js`。
+3. `web-main.js` 读取地址栏判断需要加载 `/guide/setup.md`，向后端发起 `fetch('/raw/guide/setup.md')`。
+4. 后端返回纯文本，前端复用插件引擎渲染出带样式的页面，完美实现了体验一致且免安装的 Markdown Web 阅读器。
