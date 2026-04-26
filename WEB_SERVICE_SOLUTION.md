@@ -1,18 +1,20 @@
 # 将 md-reader 改造为基于 Web 服务的 Markdown 渲染器
 
-根据需求：需要实现直接访问类似 `http://web-server/something.md` 就能看到渲染后的 Markdown。具体实现方式依然是**前端渲染**。Web Server 的职责是：
+根据需求：需要实现直接访问类似 `http://web-server/something.md` 就能看到渲染后的 Markdown。具体实现方式依然是**前端渲染**。并且，**不使用 Nginx，而是直接使用 Node.js (如 Express) 或 Python (如 FastAPI) 来处理请求**。
+
+服务器的职责是：
 1. 拦截对 `*.md` 的访问，返回一个包含公用渲染脚本的骨架 HTML 页面。
-2. 该 HTML 页面加载后，其内置的 JavaScript 逻辑去拉取真实的原始 Markdown 数据（例如从 `http://web-server/raw/something.md`），并使用现有的 `markdown-it` 逻辑在前端进行渲染。
+2. 拦截对 `/raw/*.md` 的访问，返回对应目录下的真实 Markdown 文本内容。
 3. 托管 `md-reader` 所需的所有打包后的公共静态资源（JS/CSS）。
 
 ## 1. 核心架构与请求流程
 
-**举例：用户访问 `http://web-server/docs/api.md`**
+**举例：用户访问 `http://localhost:3000/docs/api.md`**
 
 1. **浏览器发送请求**：GET `/docs/api.md`
-2. **Web Server 拦截**：Nginx 或 Node.js 检测到这是一个针对 `.md` 文件的请求。它**不返回**纯文本，而是返回一个通用的 `index.html` 骨架页面。
-3. **加载公共资源**：浏览器解析 `index.html`，加载 `@md-reader/theme` 的 CSS 和我们用 Webpack 打包好的核心渲染脚本 `web-main.js`。
-4. **前端发起数据请求**：`web-main.js` 执行。它获取当前页面的 URL 路径（即 `/docs/api.md`），将请求路径改写为指向真实文件内容的接口（例如加上前缀：`/raw/docs/api.md`），并使用 `fetch()` 发起获取原始内容的请求。
+2. **Web Server 拦截**：Node.js 或 FastAPI 检测到这是一个针对 `.md` 文件的请求。它**不返回**纯文本，而是返回一个通用的 `index.html` 骨架页面。
+3. **加载公共资源**：浏览器解析 `index.html`，加载 CSS 和我们打包好的核心渲染脚本 `/js/web-main.js`。
+4. **前端发起数据请求**：`web-main.js` 执行。它获取当前页面的 URL 路径（即 `/docs/api.md`），将请求路径改写为指向真实文件内容的接口（例如加上前缀：`/raw/docs/api.md`），并使用 `fetch()` 发起请求获取原始 Markdown 内容。
 5. **前端渲染**：获取到 Markdown 纯文本后，复用原 Chrome 插件的 `src/core/markdown.ts` 逻辑，将其转换为 HTML，并挂载到页面 DOM 中，生成侧边栏等组件。
 
 ## 2. 改造步骤与示例
@@ -120,7 +122,7 @@ initWebApp();
 
 ### 第三步：设计通用骨架 HTML
 
-创建一个基础的 HTML 模板 `index.html`。无论用户访问哪一级的目录（如 `/a.md` 或 `/foo/bar/b.md`），服务器都会返回这个页面。
+创建一个基础的 HTML 模板 `dist/index.html`。无论用户访问哪一级的目录（如 `/a.md` 或 `/foo/bar/b.md`），服务器都会返回这个页面。
 
 ```html
 <!DOCTYPE html>
@@ -140,13 +142,11 @@ initWebApp();
 </html>
 ```
 
-### 第四步：配置 Web Server 的路由重写规则
+### 第四步：编写服务端代码 (Node.js/Express)
 
-我们需要服务器做两件事：
-1. 托管静态的 JS、CSS 和公共 HTML。
-2. 将所有 `*.md` 的访问请求指向 `index.html`，同时暴露一个 `/raw/*` 路径供前端下载真实的 `.md` 文件。
+我们需要编写一个 Express 脚本，用于托管资源和处理路由转发。
 
-**以 Node.js (Express) 为例：**
+新建 `server/index.js`：
 
 ```javascript
 const express = require('express');
@@ -154,65 +154,41 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
-const MARKDOWN_DIR = path.join(__dirname, '../markdown_files'); // 真实MD文件存放的目录
+const MARKDOWN_DIR = path.join(__dirname, '../markdown_files'); // 真实MD文件存放的根目录
 const PUBLIC_DIR = path.join(__dirname, '../dist'); // 前端打包输出目录，包含 index.html 和 js/web-main.js
 
 // 1. 静态托管公共 JS 和 CSS
+// 访问 /js/web-main.js 时，会从 PUBLIC_DIR 寻找
 app.use(express.static(PUBLIC_DIR));
 
 // 2. 暴露真实的 Markdown 文件内容接口
-//当前端请求 /raw/something.md 时，返回真实的 something.md 文本
+// 当前端请求 /raw/something.md 时，会映射到 MARKDOWN_DIR/something.md 并返回纯文本
 app.use('/raw', express.static(MARKDOWN_DIR));
 
-// 3. 拦截所有的 .md 请求，返回通用的 index.html 进行前端渲染
+// 3. 拦截所有的 .md 请求，返回通用的 index.html 骨架，由前端去加载 js 进行渲染
 app.get('/*.md', (req, res) => {
+  // 不论请求的具体是哪一层级的 md，都返回相同的骨架 html
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
-// 处理其他未匹配情况
-app.get('*', (req, res) => {
-  res.send('Welcome to Markdown Web Reader. Please navigate to a .md file.');
+// 处理根路径或其他未匹配情况
+app.get('/', (req, res) => {
+  res.send('Welcome to Markdown Web Reader. Please navigate to a specific .md file (e.g., /readme.md).');
 });
 
-app.listen(3000, () => {
-  console.log('Markdown Web Server listening on port 3000');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Markdown Web Server is running on http://localhost:${PORT}`);
 });
 ```
 
-**以 Nginx 为例：**
+### 总结测试
 
-如果使用 Nginx 部署，配置如下：
-
-```nginx
-server {
-    listen 80;
-    server_name example.com;
-
-    # 根目录指向前端打包输出目录
-    root /path/to/your/dist;
-
-    # 1. 处理前端打包的静态资源
-    location /js/ {
-        try_files $uri =404;
-    }
-
-    # 2. 暴露真实的文件接口
-    location /raw/ {
-        alias /path/to/your/markdown_files/;
-        default_type text/plain;
-    }
-
-    # 3. 拦截所有的 .md 请求并返回 index.html
-    location ~ \.md$ {
-        try_files /index.html =404;
-    }
-}
-```
-
-## 总结
-
-按照上述架构，用户访问 `http://web-server/guide/setup.md` 时：
-1. 服务器响应 `index.html`。
-2. 浏览器加载并执行 `/js/web-main.js`。
-3. `web-main.js` 读取地址栏判断需要加载 `/guide/setup.md`，向后端发起 `fetch('/raw/guide/setup.md')`。
-4. 后端返回纯文本，前端复用插件引擎渲染出带样式的页面，完美实现了体验一致且免安装的 Markdown Web 阅读器。
+1. 确保将包含 Markdown 的文件夹放在根目录下的 `markdown_files` 目录中，例如 `markdown_files/test.md`。
+2. 运行 `node server/index.js` 启动服务器。
+3. 浏览器访问 `http://localhost:3000/test.md`。
+   - 服务器会返回 `dist/index.html` 骨架页面。
+   - 骨架页面加载 `/js/web-main.js`。
+   - `web-main.js` 获取到当前路径为 `/test.md`，使用 `fetch('/raw/test.md')` 向后端请求文件内容。
+   - 服务器通过 `/raw` 路由提供 `markdown_files/test.md` 的原文。
+   - 前端接收到文本后，执行 `markdown-it` 解析并渲染出内容页面。
