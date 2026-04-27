@@ -3,7 +3,12 @@ import localeJson from './locale.json'
 /* Unmatched language (in locale.json file) default use the 'en'. */
 const DEFAULT_LOCALE: string = 'en'
 /* The language of your browser Settings. */
-const BROWSER_LOCALE: string = chrome.i18n.getUILanguage()
+const BROWSER_LOCALE: string =
+  typeof chrome !== 'undefined' &&
+  chrome.i18n &&
+  typeof chrome.i18n.getUILanguage === 'function'
+    ? chrome.i18n.getUILanguage()
+    : navigator.language.split('-')[0]
 const targetLocale =
   BROWSER_LOCALE in localeJson ? BROWSER_LOCALE : DEFAULT_LOCALE
 

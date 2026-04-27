@@ -19,7 +19,14 @@ export const toTheme = (theme: Theme): Exclude<Theme, 'auto'> =>
   theme === 'auto' ? getMediaQueryTheme() : theme
 
 export function getAssetsURL(path: string): string {
-  return chrome.runtime.getURL(path)
+  if (
+    typeof chrome !== 'undefined' &&
+    chrome.runtime &&
+    typeof chrome.runtime.getURL === 'function'
+  ) {
+    return chrome.runtime.getURL(path)
+  }
+  return '/' + path
 }
 
 export function getRawContainer(selector: string = RAW_SELECTOR): HTMLElement {
