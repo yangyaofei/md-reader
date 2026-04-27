@@ -3,7 +3,9 @@ const fs = require('fs')
 const path = require('path')
 
 const app = express()
-const MARKDOWN_DIR = path.join(__dirname, '../')
+const MARKDOWN_DIR = process.env.MD_DIR
+  ? path.resolve(process.env.MD_DIR)
+  : path.join(__dirname, '../')
 const PUBLIC_DIR = path.join(__dirname, '../dist')
 
 app.use(express.static(PUBLIC_DIR))
