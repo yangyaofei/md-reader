@@ -1,8 +1,7 @@
 FROM node:18-alpine AS builder
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN npm install -g pnpm && pnpm install --no-frozen-lockfile
 COPY . .
+RUN npm install -g pnpm && pnpm install --no-frozen-lockfile
 RUN pnpm build:web
 
 FROM node:18-alpine AS runtime
