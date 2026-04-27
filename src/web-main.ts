@@ -58,11 +58,35 @@ async function initWebApp() {
     }`,
   })
 
+  function fixRelativeUrls() {
+    const dir = currentPath.substring(0, currentPath.lastIndexOf('/') + 1)
+    const base = '/raw' + dir
+    const attrs = ['src', 'href', 'data-src']
+    const tags = mdContent.queryAll('img, video, audio, source, a, iframe')
+    tags.forEach(el => {
+      attrs.forEach(attr => {
+        const val = el.getAttribute(attr)
+        if (!val) return
+        if (
+          val.startsWith('data:') ||
+          val.startsWith('http://') ||
+          val.startsWith('https://') ||
+          val.startsWith('mailto:') ||
+          val.startsWith('#') ||
+          val.startsWith('/')
+        )
+          return
+        el.setAttribute(attr, base + val)
+      })
+    })
+  }
+
   const contentRender = (code: string = '') => {
     mdContent.ele.innerHTML = mdRender(code, {
       theme: toTheme(configData.pageTheme),
       plugins: configData.mdPlugins,
     })
+    fixRelativeUrls()
   }
 
   contentRender(mdRaw)
