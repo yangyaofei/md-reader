@@ -61,10 +61,15 @@ app.get('/api/dir', (req, res) => {
 
 app.use((req, res, next) => {
   if (req.path.endsWith('.md')) {
-    res.sendFile(path.join(__dirname, 'index.html'))
-  } else {
-    next()
+    return res.sendFile(path.join(__dirname, 'index.html'))
   }
+  const absPath = path.join(MARKDOWN_DIR, req.path)
+  fs.stat(absPath, (err, stat) => {
+    if (!err && stat.isDirectory()) {
+      return res.sendFile(path.join(__dirname, 'index.html'))
+    }
+    next()
+  })
 })
 
 app.get('/', (req, res) => {

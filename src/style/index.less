@@ -312,6 +312,64 @@ body.md-reader {
     }
   }
 
+  .md-reader__index {
+    max-width: 720px;
+    margin: 60px auto;
+    padding: 0 24px;
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+      Ubuntu, sans-serif;
+    color: var(--color-text-primary);
+
+    &-header {
+      margin-bottom: 20px;
+      h1 {
+        font-size: 1.3em;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--color-text-primary);
+        word-break: break-all;
+      }
+    }
+
+    &-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      border: 1px solid var(--color-side-border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    &-item {
+      a {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 12px 20px;
+        text-decoration: none;
+        color: inherit;
+        border-bottom: 1px solid var(--color-side-border);
+        transition: background 0.1s;
+        &:hover {
+          background: var(--color-button-bg-hover);
+          color: var(--color-primary);
+        }
+      }
+      &:last-child a {
+        border-bottom: none;
+      }
+    }
+
+    &-dir a {
+      font-weight: 500;
+    }
+
+    &-file a {
+      font-size: 0.95em;
+    }
+  }
+
   &.side-collapsed {
     .md-reader {
       &__side {

@@ -17,14 +17,93 @@ const OUTLINE_SVG = `<svg viewBox="0 0 30 30" width="1.2em" height="1.2em" fill=
 
 async function initWebApp() {
   const configData = getDefaultData({})
-  let mdRaw = ''
-
   const currentPath = window.location.pathname
 
+  const globalEvent = new Event()
+  initPlugins({ event: globalEvent })
+  setTheme(configData.pageTheme)
+
   if (!currentPath.endsWith('.md')) {
-    document.body.innerHTML = '<h1>Please navigate to a specific .md file.</h1>'
+    initIndexPage(currentPath)
     return
   }
+
+  initMarkdownPage(currentPath, configData, globalEvent)
+}
+
+interface DirEntry {
+  name: string
+  path: string
+  isDirectory: boolean
+}
+
+async function initIndexPage(currentPath: string) {
+  const dirPath =
+    currentPath === '/' ? '/' : currentPath.replace(/\/$/, '') + '/'
+
+  const container = document.createElement('div')
+  container.className = 'md-reader__index'
+  document.body.appendChild(container)
+
+  const header = document.createElement('div')
+  header.className = 'md-reader__index-header'
+  header.innerHTML = `<h1>${FOLDER_SVG} ${dirPath === '/' ? '/' : dirPath}</h1>`
+  container.appendChild(header)
+
+  const list = document.createElement('ul')
+  list.className = 'md-reader__index-list'
+  container.appendChild(list)
+
+  async function renderIndexList(dir: string) {
+    try {
+      const resp = await fetch(`/api/dir?path=${encodeURIComponent(dir)}`)
+      if (!resp.ok) return
+      const data: { dirs: DirEntry[]; files: DirEntry[]; currentDir: string } =
+        await resp.json()
+      header.innerHTML = `<h1>${FOLDER_SVG} ${
+        data.currentDir === '/' ? '/' : data.currentDir + '/'
+      }</h1>`
+      list.innerHTML = ''
+
+      data.dirs.forEach(item => {
+        const li = document.createElement('li')
+        li.className = 'md-reader__index-item md-reader__index-dir'
+        const a = document.createElement('a')
+        a.href = item.path === '/' ? '/' : item.path + '/'
+        a.textContent = `📁 ${item.name}/`
+        if (item.name === '..') {
+          a.addEventListener('click', e => {
+            e.preventDefault()
+            renderIndexList(item.path)
+          })
+        }
+        li.appendChild(a)
+        list.appendChild(li)
+      })
+
+      data.files.forEach(item => {
+        const li = document.createElement('li')
+        li.className = 'md-reader__index-item md-reader__index-file'
+        const a = document.createElement('a')
+        a.href = item.path
+        a.textContent = `📄 ${item.name}`
+        li.appendChild(a)
+        list.appendChild(li)
+      })
+    } catch (e) {
+      list.innerHTML = '<li>Failed to load directory.</li>'
+    }
+  }
+
+  renderIndexList(dirPath)
+}
+
+async function initMarkdownPage(
+  currentPath: string,
+  configData: ReturnType<typeof getDefaultData>,
+  globalEvent: Event,
+) {
+  let mdRaw = ''
 
   const rawFileUrl = `/raw${currentPath}`
 
@@ -42,10 +121,6 @@ async function initWebApp() {
   rawContainer.style.display = 'none'
   rawContainer.textContent = mdRaw
   document.body.appendChild(rawContainer)
-
-  let globalEvent = new Event()
-  initPlugins({ event: globalEvent })
-  setTheme(configData.pageTheme)
 
   document.body.classList.toggle(
     className.SIDE_COLLAPSED,
@@ -165,12 +240,6 @@ async function initWebApp() {
     className: className.FILE_NAV_LIST,
   })
   filePanel.append(fileNavList)
-
-  interface DirEntry {
-    name: string
-    path: string
-    isDirectory: boolean
-  }
 
   function renderFileNavItems(data: { dirs: DirEntry[]; files: DirEntry[] }) {
     fileNavList.innerHTML = ''
