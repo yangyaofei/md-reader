@@ -1,9 +1,11 @@
 const { resolve } = require('path')
 const { merge } = require('webpack-merge')
+const MiniCssExtractPlugin = require('mini-css-extract-plugin')
 const common = require('./webpack.common.js')
 
-// Filter out CopyWebpackPlugin as we don't need manifest.json, popup.html, etc. for the web build
-const pluginsWithoutCopy = common.plugins.filter(plugin => plugin.constructor.name !== 'CopyPlugin');
+const pluginsWithoutCopy = common.plugins.filter(
+  plugin => plugin.constructor.name !== 'CopyPlugin',
+)
 
 module.exports = merge(
   {
@@ -12,16 +14,23 @@ module.exports = merge(
       'web-main': resolve(__dirname, '../src/web-main.ts'),
     },
     output: {
-      filename: 'js/[name].js',
+      filename: 'js/[name].[contenthash:8].js',
       path: resolve(__dirname, '../dist'),
-      publicPath: '/', // Ensure proper loading of assets in nested routes
+      publicPath: '/',
     },
-    plugins: pluginsWithoutCopy,
+    plugins: [
+      ...pluginsWithoutCopy.filter(
+        plugin => plugin.constructor.name !== 'MiniCssExtractPlugin',
+      ),
+      new MiniCssExtractPlugin({
+        filename: 'css/[name].[contenthash:8].css',
+      }),
+    ],
   },
   {
-    mode: 'production', // Or make it configurable, but production by default is fine for now
+    mode: 'production',
     optimization: {
       minimize: true,
     },
-  }
+  },
 )
