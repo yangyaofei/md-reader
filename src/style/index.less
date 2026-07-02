@@ -475,6 +475,11 @@ body.md-reader {
       right: 56px;
       bottom: 56px;
     }
+    &--tts-settings {
+      position: fixed;
+      right: 16px;
+      bottom: 96px;
+    }
     &--copy {
       opacity: 0;
       position: absolute;
@@ -509,6 +514,130 @@ body.md-reader {
           display: initial;
         }
       }
+    }
+  }
+}
+
+/* ---- TTS Settings modal ---- */
+.md-reader__tts-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif;
+
+  &__panel {
+    background: var(--color-side-bg, #fff);
+    color: var(--color-text-primary, #333);
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+    width: 420px;
+    max-width: 90vw;
+    max-height: 85vh;
+    overflow-y: auto;
+    border: 1px solid var(--color-side-border, #ddd);
+  }
+
+  &__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--color-side-border, #eee);
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  &__close {
+    background: none;
+    border: none;
+    font-size: 22px;
+    cursor: pointer;
+    color: inherit;
+    opacity: 0.5;
+    line-height: 1;
+    padding: 0 4px;
+    &:hover {
+      opacity: 1;
+    }
+  }
+
+  &__hint {
+    font-size: 12px;
+    opacity: 0.6;
+    margin: 0 0 12px;
+    line-height: 1.4;
+  }
+
+  &__body {
+    padding: 16px 20px;
+  }
+
+  &__field {
+    margin-bottom: 14px;
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 4px;
+    }
+    input[type='text'],
+    input[type='password'],
+    select {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--color-side-border, #ccc);
+      border-radius: 6px;
+      font-size: 13px;
+      background: var(--color-bg, #fff);
+      color: inherit;
+      box-sizing: border-box;
+      &:focus {
+        outline: none;
+        border-color: var(--color-primary, #4488ff);
+      }
+    }
+    input[type='range'] {
+      width: 100%;
+      cursor: pointer;
+    }
+  }
+
+  &__footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 20px 16px;
+    border-top: 1px solid var(--color-side-border, #eee);
+  }
+
+  &__btn--save,
+  &__btn--cancel {
+    padding: 7px 18px;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: background 0.15s;
+  }
+
+  &__btn--save {
+    background: var(--color-primary, #4488ff);
+    color: #fff;
+    &:hover {
+      opacity: 0.9;
+    }
+  }
+
+  &__btn--cancel {
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--color-side-border, #ccc);
+    &:hover {
+      background: var(--color-button-bg-hover, rgba(0, 0, 0, 0.06));
     }
   }
 }

@@ -104,30 +104,61 @@ app.get('/api/dir', (req, res) => {
   })
 })
 
+app.get('/api/tts/config', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-cache')
+  res.json({
+    serverConfigured: !!(TTS_API_URL && TTS_API_KEY),
+    defaultModel: TTS_MODEL,
+    models: ['qwen', 'tts-1', 'tts-1-hd', 'gpt-4o-mini-tts', 'volcengine'],
+    voices: [
+      'alloy',
+      'echo',
+      'fable',
+      'onyx',
+      'nova',
+      'shimmer',
+      'zh-CN-XiaoxiaoNeural',
+      'zh-CN-YunxiNeural',
+    ],
+  })
+})
+
 app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
-  const { text, voice } = req.body || {}
+  const { text, voice, speed, apiUrl, apiKey, model } = req.body || {}
+
   if (!text || typeof text !== 'string') {
     return res.status(400).json({ error: 'text is required' })
   }
-  if (!TTS_API_URL || !TTS_API_KEY) {
-    return res
-      .status(503)
-      .json({ error: 'TTS service is not configured on the server' })
+
+  const url = apiUrl || TTS_API_URL
+  const key = apiKey || TTS_API_KEY
+  const mdl = model || TTS_MODEL
+
+  if (!url || !key) {
+    return res.status(503).json({
+      error:
+        'TTS not configured. Set apiUrl/apiKey in Settings, or TTS_API_URL/TTS_API_KEY on the server.',
+    })
+  }
+
+  const apiBody = {
+    model: mdl,
+    input: text,
+    voice: voice || 'alloy',
+  }
+  if (typeof speed === 'number' && speed >= 0.25 && speed <= 4) {
+    apiBody.speed = speed
   }
 
   let ttsRes
   try {
-    ttsRes = await fetch(TTS_API_URL, {
+    ttsRes = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${TTS_API_KEY}`,
+        Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: TTS_MODEL,
-        input: text,
-        voice: voice || 'alloy',
-      }),
+      body: JSON.stringify(apiBody),
     })
   } catch (e) {
     return res

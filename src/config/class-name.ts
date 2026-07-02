@@ -17,6 +17,8 @@ export default {
   TTS_BTN: p`btn--tts`,
   TTS_PAUSE_BTN: p`btn--tts-pause`,
   TTS_STOP_BTN: p`btn--tts-stop`,
+  TTS_SETTINGS_BTN: p`btn--tts-settings`,
+  TTS_MODAL: p`tts-modal`,
   FILE_NAV: p`file-nav`,
   FILE_NAV_TITLE: p`file-nav-title`,
   FILE_NAV_TOGGLE: p`file-nav-toggle`,

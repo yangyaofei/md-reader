@@ -8,7 +8,14 @@ import { mdRender } from '@/core/markdown'
 import { getHeads, setTheme, toTheme } from '@/shared'
 import sideIcon from '@/images/icon_side.svg'
 import goTopIcon from '@/images/icon_go_top.svg'
-import { TTSPlayer, extractTextForTTS, type TTSState } from '@/core/tts'
+import {
+  TTSPlayer,
+  extractTextForTTS,
+  loadTTSConfig,
+  saveTTSConfig,
+  type TTSState,
+  type TTSConfig,
+} from '@/core/tts'
 import '@/style/index.less'
 import throttle from 'lodash.throttle'
 
@@ -21,6 +28,8 @@ const PAUSE_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="curre
 const PLAY_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor"><path d="M8 5v14l11-7L8 5z"/></svg>`
 
 const STOP_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor"><path d="M6 6h12v12H6V6z"/></svg>`
+
+const SETTINGS_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94 0 .31.04.64.09.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.21.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>`
 
 const OUTLINE_SVG = `<svg viewBox="0 0 30 30" width="1.2em" height="1.2em" fill="currentColor"><path d="M5 6.5h15.31a2 2 0 0 1 0 3H5a2 2 0 0 1 0-3m4.31 7.5h15.5a2 2 0 0 1 0 3H9.31a2 2 0 0 1 0-3M5 21.5h11.5a2 2 0 0 1 0 3H5a2 2 0 0 1 0-3"/></svg>`
 
@@ -466,6 +475,8 @@ async function initMarkdownPage(
   }
 
   /* ---- TTS (text-to-speech) controls ---- */
+  const ttsConfig = loadTTSConfig()
+
   const ttsBtn = new Ele<HTMLElement>('button', {
     className: [className.MD_BUTTON, className.TTS_BTN],
     title: 'Read aloud',
@@ -492,6 +503,13 @@ async function initMarkdownPage(
   ttsStopBtn.innerHTML = STOP_SVG
   ttsStopBtn.hide()
   ttsStopBtn.on('click', () => ttsPlayer.stop())
+
+  const ttsSettingsBtn = new Ele<HTMLElement>('button', {
+    className: [className.MD_BUTTON, className.TTS_SETTINGS_BTN],
+    title: 'TTS Settings',
+  })
+  ttsSettingsBtn.innerHTML = SETTINGS_SVG
+  ttsSettingsBtn.on('click', () => openTTSModal())
 
   function updateTTSButtons(state: TTSState) {
     switch (state) {
@@ -524,17 +542,193 @@ async function initMarkdownPage(
     }
   }
 
-  const ttsPlayer = new TTSPlayer({
-    onStateChange: updateTTSButtons,
-    onError: msg => {
-      console.error('TTS error:', msg)
+  const ttsPlayer = new TTSPlayer(
+    {
+      onStateChange: updateTTSButtons,
+      onError: msg => {
+        console.error('TTS error:', msg)
+      },
     },
-  })
+    ttsConfig,
+  )
+
+  /* ---- TTS Settings modal ---- */
+  let ttsModal: Ele<HTMLElement> | null = null
+
+  async function openTTSModal() {
+    if (ttsModal) return
+
+    let serverModels: string[] = []
+    let serverVoices: string[] = []
+    let serverConfigured = false
+    try {
+      const resp = await fetch('/api/tts/config')
+      if (resp.ok) {
+        const cfg = await resp.json()
+        serverModels = cfg.models || []
+        serverVoices = cfg.voices || []
+        serverConfigured = !!cfg.serverConfigured
+      }
+    } catch (_) {
+      /* noop */
+    }
+
+    const saved = loadTTSConfig()
+
+    const overlay = new Ele<HTMLElement>('div', {
+      className: className.TTS_MODAL,
+    })
+    overlay.ele.style.background = 'rgba(0,0,0,0.4)'
+
+    const panel = document.createElement('div')
+    panel.className = className.TTS_MODAL + '__panel'
+
+    const fieldset = (label: string, control: string) =>
+      `<div class="${className.TTS_MODAL}__field"><label>${label}</label>${control}</div>`
+
+    const apiUrlVal = saved.apiUrl || ''
+    const apiKeyVal = saved.apiKey || ''
+    const modelVal = saved.model || ''
+    const voiceVal = saved.voice || ''
+    const speedVal = saved.speed ?? 1
+
+    const modelOptions = (
+      serverModels.length
+        ? serverModels
+        : ['qwen', 'tts-1', 'tts-1-hd', 'gpt-4o-mini-tts', 'volcengine']
+    )
+      .map(
+        m =>
+          `<option value="${m}"${
+            m === modelVal ? ' selected' : ''
+          }>${m}</option>`,
+      )
+      .join('')
+
+    const voiceOptions = (
+      serverVoices.length
+        ? serverVoices
+        : [
+            'alloy',
+            'echo',
+            'fable',
+            'onyx',
+            'nova',
+            'shimmer',
+            'zh-CN-XiaoxiaoNeural',
+            'zh-CN-YunxiNeural',
+          ]
+    )
+      .map(
+        v =>
+          `<option value="${v}"${
+            v === voiceVal ? ' selected' : ''
+          }>${v}</option>`,
+      )
+      .join('')
+
+    panel.innerHTML = `
+      <div class="${className.TTS_MODAL}__header">
+        <span>TTS Settings</span>
+        <button class="${
+          className.TTS_MODAL
+        }__close" title="Close">&times;</button>
+      </div>
+      <div class="${className.TTS_MODAL}__body">
+        ${
+          serverConfigured
+            ? `<p class="${className.TTS_MODAL}__hint">Server already has a default API configured. Fill in below to override.</p>`
+            : `<p class="${className.TTS_MODAL}__hint">No server-side TTS configured. Provide API URL and Key below.</p>`
+        }
+        ${fieldset(
+          'API URL',
+          `<input type="text" data-key="apiUrl" placeholder="https://..." value="${escapeAttr(
+            apiUrlVal,
+          )}" />`,
+        )}
+        ${fieldset(
+          'API Key',
+          `<input type="password" data-key="apiKey" placeholder="Bearer token" value="${escapeAttr(
+            apiKeyVal,
+          )}" />`,
+        )}
+        ${fieldset(
+          'Model',
+          `<select data-key="model"><option value="">(server default)</option>${modelOptions}</select>`,
+        )}
+        ${fieldset(
+          'Voice',
+          `<select data-key="voice"><option value="">(server default)</option>${voiceOptions}</select>`,
+        )}
+        ${fieldset(
+          `Speed: <span data-key="speedLabel">${speedVal.toFixed(1)}x</span>`,
+          `<input type="range" data-key="speed" min="0.5" max="2" step="0.1" value="${speedVal}" />`,
+        )}
+      </div>
+      <div class="${className.TTS_MODAL}__footer">
+        <button class="${className.TTS_MODAL}__btn--save">Save</button>
+        <button class="${className.TTS_MODAL}__btn--cancel">Cancel</button>
+      </div>
+    `
+
+    overlay.ele.appendChild(panel)
+    document.body.appendChild(overlay.ele)
+    ttsModal = overlay
+
+    overlay.on('click', e => {
+      if (e.target === overlay.ele) closeTTSModal()
+    })
+
+    panel
+      .querySelector('.' + className.TTS_MODAL + '__close')!
+      .addEventListener('click', closeTTSModal)
+    panel
+      .querySelector('.' + className.TTS_MODAL + '__btn--cancel')!
+      .addEventListener('click', closeTTSModal)
+
+    const speedInput = panel.querySelector(
+      '[data-key="speed"]',
+    ) as HTMLInputElement
+    const speedLabel = panel.querySelector('[data-key="speedLabel"]')!
+    speedInput.addEventListener('input', () => {
+      speedLabel.textContent = parseFloat(speedInput.value).toFixed(1) + 'x'
+    })
+
+    panel
+      .querySelector('.' + className.TTS_MODAL + '__btn--save')!
+      .addEventListener('click', () => {
+        const newConfig: Partial<TTSConfig> = {}
+        ;['apiUrl', 'apiKey', 'model', 'voice'].forEach(k => {
+          const input = panel.querySelector(`[data-key="${k}"]`) as
+            | HTMLInputElement
+            | HTMLSelectElement
+          const val = (input as HTMLInputElement).value.trim()
+          if (val) (newConfig as any)[k] = val
+        })
+        const speed = parseFloat(speedInput.value)
+        if (!isNaN(speed) && speed > 0) newConfig.speed = speed
+
+        saveTTSConfig(newConfig)
+        ttsPlayer.updateConfig(newConfig)
+        closeTTSModal()
+      })
+  }
+
+  function closeTTSModal() {
+    if (ttsModal) {
+      ttsModal.remove()
+      ttsModal = null
+    }
+  }
+
+  function escapeAttr(s: string): string {
+    return s.replace(/"/g, '&quot;').replace(/</g, '&lt;')
+  }
 
   const buttonWrap = new Ele<HTMLElement>(
     'div',
     { className: className.BUTTON_WRAP_ELE },
-    [sideExpandBtn, goTopBtn, ttsBtn, ttsPauseBtn, ttsStopBtn],
+    [sideExpandBtn, goTopBtn, ttsBtn, ttsPauseBtn, ttsStopBtn, ttsSettingsBtn],
   )
 
   lifecycle.mount([buttonWrap, mdBody, sideWrapper])

@@ -9,22 +9,49 @@
  *  - AudioWorklet (not MediaSource): the upstream returns WAV/PCM, which MSE
  *    handles poorly. AudioWorklet gives us sample-accurate control.
  *  - Ring buffer inside the worklet: smooths network jitter.
+ *  - Speed control: fractional read position with linear interpolation,
+ *    fully client-side (the edge-tts API ignores the speed parameter).
  *  - Backpressure on the main thread: pauses stream reading when the ring
  *    buffer holds more than MAX_BUFFER_AHEAD seconds of unplayed audio.
  *  - Pause/resume: delegated to AudioContext.suspend() / resume().
  *  - Stop: AbortController aborts the fetch; AudioContext.close() frees the
  *    audio graph.
+ *  - Config: apiUrl / apiKey / model / voice / speed stored in localStorage;
+ *    sent with each request; server falls back to env vars when omitted.
  */
 
 const TTS_SAMPLE_RATE = 24000
 const WAV_HEADER_SIZE = 44
 const MAX_BUFFER_AHEAD = 8
+const CONFIG_KEY = 'md-reader__tts-config'
 
 export type TTSState = 'idle' | 'loading' | 'playing' | 'paused'
+
+export interface TTSConfig {
+  apiUrl: string
+  apiKey: string
+  model: string
+  voice: string
+  speed: number
+}
 
 export interface TTSPlayerCallbacks {
   onStateChange?: (state: TTSState) => void
   onError?: (message: string) => void
+}
+
+/* ---------- localStorage persistence ---------- */
+
+export function loadTTSConfig(): Partial<TTSConfig> {
+  try {
+    return JSON.parse(localStorage.getItem(CONFIG_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+export function saveTTSConfig(config: Partial<TTSConfig>): void {
+  localStorage.setItem(CONFIG_KEY, JSON.stringify(config))
 }
 
 /* ---------- AudioWorklet processor source ---------- */
@@ -36,7 +63,8 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     this.bufSize = ${TTS_SAMPLE_RATE} * 60
     this.rbuf = new Float32Array(this.bufSize)
     this.wpos = 0
-    this.rpos = 0
+    this.rpos = 0.0
+    this.speed = 1.0
     this.ended = false
     this.endedNotified = false
     this.port.onmessage = (e) => {
@@ -47,9 +75,13 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
       }
       if (msg === 'flush') {
         this.wpos = 0
-        this.rpos = 0
+        this.rpos = 0.0
         this.ended = false
         this.endedNotified = false
+        return
+      }
+      if (typeof msg === 'object' && msg.type === 'speed') {
+        this.speed = msg.value
         return
       }
       if (msg instanceof Float32Array) {
@@ -66,21 +98,24 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     if (!out || out.length === 0) return true
     const ch = out[0]
     if (!ch) return true
-    const available =
-      (this.wpos - this.rpos + this.bufSize) % this.bufSize
-    if (available === 0) {
-      if (this.ended && !this.endedNotified) {
-        this.port.postMessage('ended')
-        this.endedNotified = true
-      }
-      return true
-    }
     for (let i = 0; i < ch.length; i++) {
-      if (this.rpos !== this.wpos) {
-        ch[i] = this.rbuf[this.rpos]
-        this.rpos = (this.rpos + 1) % this.bufSize
-      } else {
+      const rInt = Math.floor(this.rpos)
+      const avail = (this.wpos - rInt + this.bufSize) % this.bufSize
+      if (avail === 0) {
         ch[i] = 0
+        if (this.ended && !this.endedNotified) {
+          this.port.postMessage('ended')
+          this.endedNotified = true
+        }
+      } else {
+        const idx = rInt % this.bufSize
+        const frac = this.rpos - rInt
+        const nextIdx = (idx + 1) % this.bufSize
+        const nextAvail = (this.wpos - rInt - 1 + this.bufSize) % this.bufSize
+        const nextVal = nextAvail > 0 ? this.rbuf[nextIdx] : this.rbuf[idx]
+        ch[i] = this.rbuf[idx] * (1 - frac) + nextVal * frac
+        this.rpos += this.speed
+        if (this.rpos >= this.bufSize) this.rpos -= this.bufSize
       }
     }
     return true
@@ -140,12 +175,20 @@ export class TTSPlayer {
   private state: TTSState = 'idle'
   private samplesSent = 0
   private startTime = 0
-  private voice: string
+  private config: Partial<TTSConfig>
   private callbacks: TTSPlayerCallbacks
 
-  constructor(callbacks: TTSPlayerCallbacks = {}, voice: string = 'alloy') {
+  constructor(
+    callbacks: TTSPlayerCallbacks = {},
+    config: Partial<TTSConfig> = {},
+  ) {
     this.callbacks = callbacks
-    this.voice = voice
+    this.config = config
+  }
+
+  /** Update config at runtime (e.g. when user saves settings). */
+  updateConfig(config: Partial<TTSConfig>): void {
+    this.config = { ...this.config, ...config }
   }
 
   getState(): TTSState {
@@ -179,6 +222,12 @@ export class TTSPlayer {
       this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-player')
       this.workletNode.connect(this.audioContext.destination)
 
+      /* Set playback speed */
+      const speed = this.config.speed ?? 1
+      if (speed !== 1) {
+        this.workletNode.port.postMessage({ type: 'speed', value: speed })
+      }
+
       this.workletNode.port.onmessage = (e: MessageEvent) => {
         if (e.data === 'ended') {
           this.setState('idle')
@@ -188,10 +237,17 @@ export class TTSPlayer {
 
       this.abortController = new AbortController()
 
+      const reqBody: Record<string, unknown> = { text }
+      if (this.config.voice) reqBody.voice = this.config.voice
+      if (this.config.model) reqBody.model = this.config.model
+      if (this.config.apiUrl) reqBody.apiUrl = this.config.apiUrl
+      if (this.config.apiKey) reqBody.apiKey = this.config.apiKey
+      if (speed !== 1) reqBody.speed = speed
+
       const response = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice: this.voice }),
+        body: JSON.stringify(reqBody),
         signal: this.abortController.signal,
       })
 
