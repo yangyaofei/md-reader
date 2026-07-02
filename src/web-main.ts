@@ -8,10 +8,19 @@ import { mdRender } from '@/core/markdown'
 import { getHeads, setTheme, toTheme } from '@/shared'
 import sideIcon from '@/images/icon_side.svg'
 import goTopIcon from '@/images/icon_go_top.svg'
+import { TTSPlayer, extractTextForTTS, type TTSState } from '@/core/tts'
 import '@/style/index.less'
 import throttle from 'lodash.throttle'
 
 const FOLDER_SVG = `<svg viewBox="0 0 24 24" width="1.2em" height="1.2em" fill="currentColor"><path d="M3.2 21Q1 21 1 18.75V5.25Q1 3 3.2 3h6.18q.54 0 .93.4l1.61 1.65q.19.2.46.2H20.8Q23 5.25 23 7.5V18.75Q23 21 20.8 21zm1-2.25h15.6q.55 0 .55-.55V8.5q0-.55-.55-.55h-8.29q-.54 0-.93-.4L9.19 5.9q-.19-.2-.46-.2H4.2q-.55 0-.55.55v11.5q0 .55.55.55"/></svg>`
+
+const SPEAKER_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>`
+
+const PAUSE_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`
+
+const PLAY_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor"><path d="M8 5v14l11-7L8 5z"/></svg>`
+
+const STOP_SVG = `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor"><path d="M6 6h12v12H6V6z"/></svg>`
 
 const OUTLINE_SVG = `<svg viewBox="0 0 30 30" width="1.2em" height="1.2em" fill="currentColor"><path d="M5 6.5h15.31a2 2 0 0 1 0 3H5a2 2 0 0 1 0-3m4.31 7.5h15.5a2 2 0 0 1 0 3H9.31a2 2 0 0 1 0-3M5 21.5h11.5a2 2 0 0 1 0 3H5a2 2 0 0 1 0-3"/></svg>`
 
@@ -456,10 +465,76 @@ async function initMarkdownPage(
     return false
   }
 
+  /* ---- TTS (text-to-speech) controls ---- */
+  const ttsBtn = new Ele<HTMLElement>('button', {
+    className: [className.MD_BUTTON, className.TTS_BTN],
+    title: 'Read aloud',
+  })
+  ttsBtn.innerHTML = SPEAKER_SVG
+  ttsBtn.on('click', async () => {
+    const text = extractTextForTTS(mdContent.ele)
+    if (!text) return
+    await ttsPlayer.play(text)
+  })
+
+  const ttsPauseBtn = new Ele<HTMLElement>('button', {
+    className: [className.MD_BUTTON, className.TTS_PAUSE_BTN],
+    title: 'Pause',
+  })
+  ttsPauseBtn.innerHTML = PAUSE_SVG
+  ttsPauseBtn.hide()
+  ttsPauseBtn.on('click', () => ttsPlayer.togglePause())
+
+  const ttsStopBtn = new Ele<HTMLElement>('button', {
+    className: [className.MD_BUTTON, className.TTS_STOP_BTN],
+    title: 'Stop',
+  })
+  ttsStopBtn.innerHTML = STOP_SVG
+  ttsStopBtn.hide()
+  ttsStopBtn.on('click', () => ttsPlayer.stop())
+
+  function updateTTSButtons(state: TTSState) {
+    switch (state) {
+      case 'idle':
+        ttsBtn.show()
+        ttsPauseBtn.hide()
+        ttsStopBtn.hide()
+        break
+      case 'loading':
+        ttsBtn.hide()
+        ttsPauseBtn.show()
+        ttsPauseBtn.innerHTML = PAUSE_SVG
+        ttsPauseBtn.ele.title = 'Loading...'
+        ttsStopBtn.show()
+        break
+      case 'playing':
+        ttsBtn.hide()
+        ttsPauseBtn.show()
+        ttsPauseBtn.innerHTML = PAUSE_SVG
+        ttsPauseBtn.ele.title = 'Pause'
+        ttsStopBtn.show()
+        break
+      case 'paused':
+        ttsBtn.hide()
+        ttsPauseBtn.show()
+        ttsPauseBtn.innerHTML = PLAY_SVG
+        ttsPauseBtn.ele.title = 'Resume'
+        ttsStopBtn.show()
+        break
+    }
+  }
+
+  const ttsPlayer = new TTSPlayer({
+    onStateChange: updateTTSButtons,
+    onError: msg => {
+      console.error('TTS error:', msg)
+    },
+  })
+
   const buttonWrap = new Ele<HTMLElement>(
     'div',
     { className: className.BUTTON_WRAP_ELE },
-    [sideExpandBtn, goTopBtn],
+    [sideExpandBtn, goTopBtn, ttsBtn, ttsPauseBtn, ttsStopBtn],
   )
 
   lifecycle.mount([buttonWrap, mdBody, sideWrapper])
