@@ -104,23 +104,77 @@ app.get('/api/dir', (req, res) => {
   })
 })
 
-app.get('/api/tts/config', (_req, res) => {
+app.get('/api/tts/config', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache')
-  res.json({
+
+  const clientApiUrl = req.query.apiUrl
+  const clientApiKey = req.query.apiKey
+  const baseUrl = (clientApiUrl || TTS_API_URL || '').replace(
+    /\/audio\/speech\/?$/,
+    '',
+  )
+  const key = clientApiKey || TTS_API_KEY
+
+  const fallback = {
     serverConfigured: !!(TTS_API_URL && TTS_API_KEY),
     defaultModel: TTS_MODEL,
-    models: ['qwen', 'tts-1', 'tts-1-hd', 'gpt-4o-mini-tts', 'volcengine'],
-    voices: [
-      'alloy',
-      'echo',
-      'fable',
-      'onyx',
-      'nova',
-      'shimmer',
-      'zh-CN-XiaoxiaoNeural',
-      'zh-CN-YunxiNeural',
-    ],
-  })
+    models: [],
+    voices: [],
+  }
+
+  if (!baseUrl || !key) {
+    return res.json(fallback)
+  }
+
+  try {
+    const authHdr = { Authorization: `Bearer ${key}` }
+    const [modelsResp, voicesResp] = await Promise.all([
+      fetch(`${baseUrl}/models`, { headers: authHdr }),
+      fetch(`${baseUrl}/audio/voices`, { headers: authHdr }),
+    ])
+
+    let models = []
+    let voices = []
+
+    if (modelsResp.ok) {
+      const md = await modelsResp.json()
+      models = (md.data || []).map(m => m.id)
+    }
+
+    if (voicesResp.ok) {
+      const vd = await voicesResp.json()
+      voices = (Array.isArray(vd) ? vd : vd.data || []).map(v => {
+        if (v.ShortName) {
+          return {
+            id: v.ShortName,
+            name: v.FriendlyName || v.ShortName,
+            engine: v.engine || 'edge',
+            locale: v.Locale || '',
+            gender: v.Gender || '',
+          }
+        }
+        return {
+          id: v.id,
+          name: v.name || v.id,
+          engine: v.engine || '',
+          locale: v.locale || v.language || '',
+          gender: v.Gender || '',
+        }
+      })
+    }
+
+    res.json({
+      serverConfigured: !!(TTS_API_URL && TTS_API_KEY),
+      defaultModel: TTS_MODEL,
+      models,
+      voices,
+    })
+  } catch (e) {
+    res.json({
+      ...fallback,
+      error: 'Failed to fetch from TTS API: ' + e.message,
+    })
+  }
 })
 
 app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {

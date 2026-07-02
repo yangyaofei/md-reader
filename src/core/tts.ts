@@ -63,8 +63,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     this.bufSize = ${TTS_SAMPLE_RATE} * 60
     this.rbuf = new Float32Array(this.bufSize)
     this.wpos = 0
-    this.rpos = 0.0
-    this.speed = 1.0
+    this.rpos = 0
     this.ended = false
     this.endedNotified = false
     this.port.onmessage = (e) => {
@@ -75,13 +74,9 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
       }
       if (msg === 'flush') {
         this.wpos = 0
-        this.rpos = 0.0
+        this.rpos = 0
         this.ended = false
         this.endedNotified = false
-        return
-      }
-      if (typeof msg === 'object' && msg.type === 'speed') {
-        this.speed = msg.value
         return
       }
       if (msg instanceof Float32Array) {
@@ -99,23 +94,15 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     const ch = out[0]
     if (!ch) return true
     for (let i = 0; i < ch.length; i++) {
-      const rInt = Math.floor(this.rpos)
-      const avail = (this.wpos - rInt + this.bufSize) % this.bufSize
-      if (avail === 0) {
+      if (this.rpos !== this.wpos) {
+        ch[i] = this.rbuf[this.rpos]
+        this.rpos = (this.rpos + 1) % this.bufSize
+      } else {
         ch[i] = 0
         if (this.ended && !this.endedNotified) {
           this.port.postMessage('ended')
           this.endedNotified = true
         }
-      } else {
-        const idx = rInt % this.bufSize
-        const frac = this.rpos - rInt
-        const nextIdx = (idx + 1) % this.bufSize
-        const nextAvail = (this.wpos - rInt - 1 + this.bufSize) % this.bufSize
-        const nextVal = nextAvail > 0 ? this.rbuf[nextIdx] : this.rbuf[idx]
-        ch[i] = this.rbuf[idx] * (1 - frac) + nextVal * frac
-        this.rpos += this.speed
-        if (this.rpos >= this.bufSize) this.rpos -= this.bufSize
       }
     }
     return true
@@ -222,12 +209,6 @@ export class TTSPlayer {
       this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-player')
       this.workletNode.connect(this.audioContext.destination)
 
-      /* Set playback speed */
-      const speed = this.config.speed ?? 1
-      if (speed !== 1) {
-        this.workletNode.port.postMessage({ type: 'speed', value: speed })
-      }
-
       this.workletNode.port.onmessage = (e: MessageEvent) => {
         if (e.data === 'ended') {
           this.setState('idle')
@@ -242,6 +223,7 @@ export class TTSPlayer {
       if (this.config.model) reqBody.model = this.config.model
       if (this.config.apiUrl) reqBody.apiUrl = this.config.apiUrl
       if (this.config.apiKey) reqBody.apiKey = this.config.apiKey
+      const speed = this.config.speed ?? 1
       if (speed !== 1) reqBody.speed = speed
 
       const response = await fetch('/api/tts', {

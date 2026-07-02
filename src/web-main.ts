@@ -555,25 +555,40 @@ async function initMarkdownPage(
   /* ---- TTS Settings modal ---- */
   let ttsModal: Ele<HTMLElement> | null = null
 
+  interface RemoteVoice {
+    id: string
+    name: string
+    engine: string
+    locale: string
+    gender: string
+  }
+
   async function openTTSModal() {
     if (ttsModal) return
 
+    const saved = loadTTSConfig()
+
     let serverModels: string[] = []
-    let serverVoices: string[] = []
+    let serverVoices: RemoteVoice[] = []
     let serverConfigured = false
+    let fetchError = ''
+
+    const configParams = new URLSearchParams()
+    if (saved.apiUrl) configParams.set('apiUrl', saved.apiUrl)
+    if (saved.apiKey) configParams.set('apiKey', saved.apiKey)
+
     try {
-      const resp = await fetch('/api/tts/config')
+      const resp = await fetch(`/api/tts/config?${configParams.toString()}`)
       if (resp.ok) {
         const cfg = await resp.json()
         serverModels = cfg.models || []
         serverVoices = cfg.voices || []
         serverConfigured = !!cfg.serverConfigured
+        if (cfg.error) fetchError = cfg.error
       }
-    } catch (_) {
-      /* noop */
+    } catch (e: any) {
+      fetchError = e.message || String(e)
     }
-
-    const saved = loadTTSConfig()
 
     const overlay = new Ele<HTMLElement>('div', {
       className: className.TTS_MODAL,
@@ -583,7 +598,7 @@ async function initMarkdownPage(
     const panel = document.createElement('div')
     panel.className = className.TTS_MODAL + '__panel'
 
-    const fieldset = (label: string, control: string) =>
+    const field = (label: string, control: string) =>
       `<div class="${className.TTS_MODAL}__field"><label>${label}</label>${control}</div>`
 
     const apiUrlVal = saved.apiUrl || ''
@@ -592,11 +607,8 @@ async function initMarkdownPage(
     const voiceVal = saved.voice || ''
     const speedVal = saved.speed ?? 1
 
-    const modelOptions = (
-      serverModels.length
-        ? serverModels
-        : ['qwen', 'tts-1', 'tts-1-hd', 'gpt-4o-mini-tts', 'volcengine']
-    )
+    /* Build model <option>s */
+    const modelOptions = serverModels
       .map(
         m =>
           `<option value="${m}"${
@@ -605,27 +617,40 @@ async function initMarkdownPage(
       )
       .join('')
 
-    const voiceOptions = (
-      serverVoices.length
-        ? serverVoices
-        : [
-            'alloy',
-            'echo',
-            'fable',
-            'onyx',
-            'nova',
-            'shimmer',
-            'zh-CN-XiaoxiaoNeural',
-            'zh-CN-YunxiNeural',
-          ]
-    )
-      .map(
-        v =>
-          `<option value="${v}"${
-            v === voiceVal ? ' selected' : ''
-          }>${v}</option>`,
-      )
+    /* Build voice <optgroup>s grouped by engine */
+    const engines = new Map<string, RemoteVoice[]>()
+    for (const v of serverVoices) {
+      const eng = v.engine || 'other'
+      if (!engines.has(eng)) engines.set(eng, [])
+      engines.get(eng)!.push(v)
+    }
+    const engineOrder = ['qwen', 'volcengine', 'edge']
+    const sortedEngines = [...engines.keys()].sort((a, b) => {
+      const ia = engineOrder.indexOf(a)
+      const ib = engineOrder.indexOf(b)
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
+    })
+
+    const voiceGroups = sortedEngines
+      .map(eng => {
+        const items = engines.get(eng)!
+        const opts = items
+          .map(
+            v =>
+              `<option value="${escapeAttr(v.id)}"${
+                v.id === voiceVal ? ' selected' : ''
+              }>${escapeAttr(v.name || v.id)}</option>`,
+          )
+          .join('')
+        return `<optgroup label="${eng} (${items.length})">${opts}</optgroup>`
+      })
       .join('')
+
+    const hintText = fetchError
+      ? `⚠️ ${escapeAttr(fetchError)}`
+      : serverConfigured
+      ? 'Server has a default API configured. Fields below override it.'
+      : 'No server-side TTS. Provide API URL and Key below.'
 
     panel.innerHTML = `
       <div class="${className.TTS_MODAL}__header">
@@ -635,32 +660,28 @@ async function initMarkdownPage(
         }__close" title="Close">&times;</button>
       </div>
       <div class="${className.TTS_MODAL}__body">
-        ${
-          serverConfigured
-            ? `<p class="${className.TTS_MODAL}__hint">Server already has a default API configured. Fill in below to override.</p>`
-            : `<p class="${className.TTS_MODAL}__hint">No server-side TTS configured. Provide API URL and Key below.</p>`
-        }
-        ${fieldset(
+        <p class="${className.TTS_MODAL}__hint">${escapeAttr(hintText)}</p>
+        ${field(
           'API URL',
-          `<input type="text" data-key="apiUrl" placeholder="https://..." value="${escapeAttr(
+          `<input type="text" data-key="apiUrl" placeholder="https://.../v1/audio/speech" value="${escapeAttr(
             apiUrlVal,
           )}" />`,
         )}
-        ${fieldset(
+        ${field(
           'API Key',
           `<input type="password" data-key="apiKey" placeholder="Bearer token" value="${escapeAttr(
             apiKeyVal,
           )}" />`,
         )}
-        ${fieldset(
+        ${field(
           'Model',
           `<select data-key="model"><option value="">(server default)</option>${modelOptions}</select>`,
         )}
-        ${fieldset(
+        ${field(
           'Voice',
-          `<select data-key="voice"><option value="">(server default)</option>${voiceOptions}</select>`,
+          `<select data-key="voice"><option value="">(server default)</option>${voiceGroups}</select>`,
         )}
-        ${fieldset(
+        ${field(
           `Speed: <span data-key="speedLabel">${speedVal.toFixed(1)}x</span>`,
           `<input type="range" data-key="speed" min="0.5" max="2" step="0.1" value="${speedVal}" />`,
         )}
@@ -692,6 +713,73 @@ async function initMarkdownPage(
     const speedLabel = panel.querySelector('[data-key="speedLabel"]')!
     speedInput.addEventListener('input', () => {
       speedLabel.textContent = parseFloat(speedInput.value).toFixed(1) + 'x'
+    })
+
+    /* Refresh voices/models when apiUrl or apiKey changes */
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null
+    const refreshConfig = () => {
+      if (refreshTimer) clearTimeout(refreshTimer)
+      refreshTimer = setTimeout(async () => {
+        const params = new URLSearchParams()
+        const urlIn = panel.querySelector(
+          '[data-key="apiUrl"]',
+        ) as HTMLInputElement
+        const keyIn = panel.querySelector(
+          '[data-key="apiKey"]',
+        ) as HTMLInputElement
+        if (urlIn.value.trim()) params.set('apiUrl', urlIn.value.trim())
+        if (keyIn.value.trim()) params.set('apiKey', keyIn.value.trim())
+        try {
+          const r = await fetch(`/api/tts/config?${params.toString()}`)
+          if (!r.ok) return
+          const c = await r.json()
+          /* Update model select */
+          const modelSel = panel.querySelector(
+            '[data-key="model"]',
+          ) as HTMLSelectElement
+          const curModel = modelSel.value
+          modelSel.innerHTML =
+            '<option value="">(server default)</option>' +
+            (c.models || [])
+              .map((m: string) => `<option value="${m}">${m}</option>`)
+              .join('')
+          if (curModel) modelSel.value = curModel
+          /* Update voice select */
+          const voiceSel = panel.querySelector(
+            '[data-key="voice"]',
+          ) as HTMLSelectElement
+          const curVoice = voiceSel.value
+          const engs = new Map<string, RemoteVoice[]>()
+          for (const v of c.voices || []) {
+            const e = v.engine || 'other'
+            if (!engs.has(e)) engs.set(e, [])
+            engs.get(e)!.push(v)
+          }
+          voiceSel.innerHTML =
+            '<option value="">(server default)</option>' +
+            [...engs.entries()]
+              .map(
+                ([eng, items]) =>
+                  `<optgroup label="${eng} (${items.length})">${items
+                    .map(
+                      (v: RemoteVoice) =>
+                        `<option value="${escapeAttr(v.id)}">${escapeAttr(
+                          v.name || v.id,
+                        )}</option>`,
+                    )
+                    .join('')}</optgroup>`,
+              )
+              .join('')
+          if (curVoice) voiceSel.value = curVoice
+        } catch (_) {
+          /* noop */
+        }
+      }, 600)
+    }
+    ;['apiUrl', 'apiKey'].forEach(k => {
+      ;(panel.querySelector(
+        `[data-key="${k}"]`,
+      ) as HTMLInputElement)!.addEventListener('input', refreshConfig)
     })
 
     panel
