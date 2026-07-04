@@ -204,7 +204,23 @@ app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
     apiBody.speed = speed
   }
 
-  let ttsRes
+  let ttsRes = null
+  const abortCtrl = new AbortController()
+  let pipeStarted = false
+  const cleanup = () => {
+    abortCtrl.abort()
+    if (ttsRes && pipeStarted) {
+      try {
+        ttsRes.body.cancel()
+      } catch (_) {
+        /* noop */
+      }
+    }
+  }
+  // Express 5: req.on('close') 在请求体读取后就触发（不是客户端断开）。
+  // 用 res.on('close') 检测客户端断开（响应被关闭时才触发）。
+  res.on('close', cleanup)
+
   try {
     ttsRes = await fetch(url, {
       method: 'POST',
@@ -213,8 +229,10 @@ app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(apiBody),
+      signal: abortCtrl.signal,
     })
   } catch (e) {
+    if (e.name === 'AbortError') return
     return res
       .status(502)
       .json({ error: 'TTS upstream unreachable: ' + e.message })
@@ -229,15 +247,7 @@ app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
 
   res.setHeader('Content-Type', 'audio/wav')
   res.setHeader('Cache-Control', 'no-cache')
-
-  const cleanup = () => {
-    try {
-      ttsRes.body.cancel()
-    } catch (_) {
-      /* noop */
-    }
-  }
-  req.on('close', cleanup)
+  pipeStarted = true
 
   try {
     Readable.fromWeb(ttsRes.body).pipe(res)
