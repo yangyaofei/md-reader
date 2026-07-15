@@ -13,8 +13,10 @@ import {
   extractTextForTTS,
   loadTTSConfig,
   saveTTSConfig,
+  fetchTTSConfig,
   type TTSState,
   type TTSConfig,
+  type RemoteVoice,
 } from '@/core/tts'
 import '@/style/index.less'
 import throttle from 'lodash.throttle'
@@ -555,14 +557,6 @@ async function initMarkdownPage(
   /* ---- TTS Settings modal ---- */
   let ttsModal: Ele<HTMLElement> | null = null
 
-  interface RemoteVoice {
-    id: string
-    name: string
-    engine: string
-    locale: string
-    gender: string
-  }
-
   async function openTTSModal() {
     if (ttsModal) return
 
@@ -573,22 +567,11 @@ async function initMarkdownPage(
     let serverConfigured = false
     let fetchError = ''
 
-    const configParams = new URLSearchParams()
-    if (saved.apiUrl) configParams.set('apiUrl', saved.apiUrl)
-    if (saved.apiKey) configParams.set('apiKey', saved.apiKey)
-
-    try {
-      const resp = await fetch(`/api/tts/config?${configParams.toString()}`)
-      if (resp.ok) {
-        const cfg = await resp.json()
-        serverModels = cfg.models || []
-        serverVoices = cfg.voices || []
-        serverConfigured = !!cfg.serverConfigured
-        if (cfg.error) fetchError = cfg.error
-      }
-    } catch (e: any) {
-      fetchError = e.message || String(e)
-    }
+    const cfg = await fetchTTSConfig(saved)
+    serverModels = cfg.models
+    serverVoices = cfg.voices
+    serverConfigured = cfg.serverConfigured
+    if (cfg.error) fetchError = cfg.error
 
     const overlay = new Ele<HTMLElement>('div', {
       className: className.TTS_MODAL,
@@ -720,60 +703,52 @@ async function initMarkdownPage(
     const refreshConfig = () => {
       if (refreshTimer) clearTimeout(refreshTimer)
       refreshTimer = setTimeout(async () => {
-        const params = new URLSearchParams()
         const urlIn = panel.querySelector(
           '[data-key="apiUrl"]',
         ) as HTMLInputElement
         const keyIn = panel.querySelector(
           '[data-key="apiKey"]',
         ) as HTMLInputElement
-        if (urlIn.value.trim()) params.set('apiUrl', urlIn.value.trim())
-        if (keyIn.value.trim()) params.set('apiKey', keyIn.value.trim())
-        try {
-          const r = await fetch(`/api/tts/config?${params.toString()}`)
-          if (!r.ok) return
-          const c = await r.json()
-          /* Update model select */
-          const modelSel = panel.querySelector(
-            '[data-key="model"]',
-          ) as HTMLSelectElement
-          const curModel = modelSel.value
-          modelSel.innerHTML =
-            '<option value="">(server default)</option>' +
-            (c.models || [])
-              .map((m: string) => `<option value="${m}">${m}</option>`)
-              .join('')
-          if (curModel) modelSel.value = curModel
-          /* Update voice select */
-          const voiceSel = panel.querySelector(
-            '[data-key="voice"]',
-          ) as HTMLSelectElement
-          const curVoice = voiceSel.value
-          const engs = new Map<string, RemoteVoice[]>()
-          for (const v of c.voices || []) {
-            const e = v.engine || 'other'
-            if (!engs.has(e)) engs.set(e, [])
-            engs.get(e)!.push(v)
-          }
-          voiceSel.innerHTML =
-            '<option value="">(server default)</option>' +
-            [...engs.entries()]
-              .map(
-                ([eng, items]) =>
-                  `<optgroup label="${eng} (${items.length})">${items
-                    .map(
-                      (v: RemoteVoice) =>
-                        `<option value="${escapeAttr(v.id)}">${escapeAttr(
-                          v.name || v.id,
-                        )}</option>`,
-                    )
-                    .join('')}</optgroup>`,
-              )
-              .join('')
-          if (curVoice) voiceSel.value = curVoice
-        } catch (_) {
-          /* noop */
+        const c = await fetchTTSConfig({
+          apiUrl: urlIn.value.trim(),
+          apiKey: keyIn.value.trim(),
+        })
+        /* Update model select */
+        const modelSel = panel.querySelector(
+          '[data-key="model"]',
+        ) as HTMLSelectElement
+        const curModel = modelSel.value
+        modelSel.innerHTML =
+          '<option value="">(server default)</option>' +
+          c.models.map(m => `<option value="${m}">${m}</option>`).join('')
+        if (curModel) modelSel.value = curModel
+        /* Update voice select */
+        const voiceSel = panel.querySelector(
+          '[data-key="voice"]',
+        ) as HTMLSelectElement
+        const curVoice = voiceSel.value
+        const engs = new Map<string, RemoteVoice[]>()
+        for (const v of c.voices) {
+          const e = v.engine || 'other'
+          if (!engs.has(e)) engs.set(e, [])
+          engs.get(e)!.push(v)
         }
+        voiceSel.innerHTML =
+          '<option value="">(server default)</option>' +
+          [...engs.entries()]
+            .map(
+              ([eng, items]) =>
+                `<optgroup label="${eng} (${items.length})">${items
+                  .map(
+                    v =>
+                      `<option value="${escapeAttr(v.id)}">${escapeAttr(
+                        v.name || v.id,
+                      )}</option>`,
+                  )
+                  .join('')}</optgroup>`,
+            )
+            .join('')
+        if (curVoice) voiceSel.value = curVoice
       }, 600)
     }
     ;['apiUrl', 'apiKey'].forEach(k => {

@@ -35,6 +35,14 @@ export interface TTSConfig {
   speed: number
 }
 
+export interface RemoteVoice {
+  id: string
+  name: string
+  engine: string
+  locale: string
+  gender: string
+}
+
 export interface TTSPlayerCallbacks {
   onStateChange?: (state: TTSState) => void
   onError?: (message: string) => void
@@ -52,6 +60,85 @@ export function loadTTSConfig(): Partial<TTSConfig> {
 
 export function saveTTSConfig(config: Partial<TTSConfig>): void {
   localStorage.setItem(CONFIG_KEY, JSON.stringify(config))
+}
+
+/* ---------- Direct TTS API access ---------- */
+
+function normalizeVoice(v: any): RemoteVoice {
+  if (v.ShortName) {
+    return {
+      id: v.ShortName,
+      name: v.FriendlyName || v.ShortName,
+      engine: v.engine || 'edge',
+      locale: v.Locale || '',
+      gender: v.Gender || '',
+    }
+  }
+  return {
+    id: v.id,
+    name: v.name || v.id,
+    engine: v.engine || '',
+    locale: v.locale || v.language || '',
+    gender: v.Gender || '',
+  }
+}
+
+/**
+ * Fetch models + voices from the TTS API.
+ * Calls the TTS API directly when apiUrl+apiKey are configured;
+ * falls back to the server proxy /api/tts/config otherwise.
+ */
+export async function fetchTTSConfig(config: Partial<TTSConfig>): Promise<{
+  models: string[]
+  voices: RemoteVoice[]
+  serverConfigured: boolean
+  error?: string
+}> {
+  if (config.apiUrl && config.apiKey) {
+    const baseUrl = config.apiUrl.replace(/\/audio\/speech\/?$/, '')
+    const authHdr = { Authorization: `Bearer ${config.apiKey}` }
+    try {
+      const [modelsResp, voicesResp] = await Promise.all([
+        fetch(`${baseUrl}/models`, { headers: authHdr }),
+        fetch(`${baseUrl}/audio/voices`, { headers: authHdr }),
+      ])
+      let models: string[] = []
+      let voices: RemoteVoice[] = []
+      if (modelsResp.ok) {
+        const md = await modelsResp.json()
+        models = (md.data || []).map((m: any) => m.id)
+      }
+      if (voicesResp.ok) {
+        const vd = await voicesResp.json()
+        voices = (Array.isArray(vd) ? vd : vd.data || []).map(normalizeVoice)
+      }
+      return { models, voices, serverConfigured: false }
+    } catch (e: any) {
+      return {
+        models: [],
+        voices: [],
+        serverConfigured: false,
+        error: e.message || String(e),
+      }
+    }
+  }
+
+  /* Fall back to server proxy */
+  try {
+    const params = new URLSearchParams()
+    if (config.apiUrl) params.set('apiUrl', config.apiUrl)
+    if (config.apiKey) params.set('apiKey', config.apiKey)
+    const resp = await fetch(`/api/tts/config?${params.toString()}`)
+    if (resp.ok) return await resp.json()
+  } catch (e: any) {
+    return {
+      models: [],
+      voices: [],
+      serverConfigured: false,
+      error: e.message || String(e),
+    }
+  }
+  return { models: [], voices: [], serverConfigured: false }
 }
 
 /* ---------- AudioWorklet processor source ---------- */
@@ -218,18 +305,35 @@ export class TTSPlayer {
 
       this.abortController = new AbortController()
 
-      const reqBody: Record<string, unknown> = { text }
-      if (this.config.voice) reqBody.voice = this.config.voice
-      if (this.config.model) reqBody.model = this.config.model
-      if (this.config.apiUrl) reqBody.apiUrl = this.config.apiUrl
-      if (this.config.apiKey) reqBody.apiKey = this.config.apiKey
       const speed = this.config.speed ?? 1
-      if (speed !== 1) reqBody.speed = speed
+      const useDirect = !!(this.config.apiUrl && this.config.apiKey)
 
-      const response = await fetch('/api/tts', {
+      const fetchUrl = useDirect ? this.config.apiUrl! : '/api/tts'
+      const fetchHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+      }
+      if (useDirect) {
+        fetchHeaders['Authorization'] = `Bearer ${this.config.apiKey}`
+      }
+
+      const fetchBody = useDirect
+        ? JSON.stringify({
+            model: this.config.model || 'qwen',
+            input: text,
+            voice: this.config.voice || 'alloy',
+            ...(speed !== 1 && { speed }),
+          })
+        : JSON.stringify({
+            text,
+            ...(this.config.voice && { voice: this.config.voice }),
+            ...(this.config.model && { model: this.config.model }),
+            ...(speed !== 1 && { speed }),
+          })
+
+      const response = await fetch(fetchUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(reqBody),
+        headers: fetchHeaders,
+        body: fetchBody,
         signal: this.abortController.signal,
       })
 
