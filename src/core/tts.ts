@@ -410,7 +410,7 @@ export class TTSPlayer {
         this.emitProgress()
       }
 
-      const checkBuffer = () => {
+      const checkBuffer = async () => {
         if (!this.audioContext || !startedPlaying || this.userPaused) return
 
         const played =
@@ -420,10 +420,10 @@ export class TTSPlayer {
         const buffered = this.samplesSent / TTS_SAMPLE_RATE - played
 
         if (this.state === 'playing' && buffered < preBuffer * 0.5) {
-          this.audioContext.suspend()
+          await this.audioContext.suspend()
           this.setState('buffering')
         } else if (this.state === 'buffering' && buffered >= preBuffer) {
-          this.audioContext.resume()
+          await this.audioContext.resume()
           this.playStartTime = this.audioContext.currentTime - played
           this.setState('playing')
           this.emitProgress()
@@ -461,7 +461,7 @@ export class TTSPlayer {
         this.workletNode?.port.postMessage(float32, [float32.buffer])
 
         await maybeStart()
-        checkBuffer()
+        await checkBuffer()
       }
 
       // --- stream ended ---
