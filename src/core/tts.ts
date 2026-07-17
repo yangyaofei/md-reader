@@ -329,6 +329,9 @@ export class TTSPlayer {
 
     try {
       this.audioContext = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume()
+      }
       this.playStartTime = this.audioContext.currentTime
       this.samplesSent = 0
       this.lastProgressTime = 0
@@ -394,6 +397,9 @@ export class TTSPlayer {
       const maybeStart = () => {
         if (startedPlaying || !this.workletNode || !this.audioContext) return
         if (this.samplesSent < preBufferSamples) return
+        if (this.audioContext.state !== 'running') {
+          this.audioContext.resume()
+        }
         this.workletNode.connect(this.audioContext.destination)
         this.playStartTime = this.audioContext.currentTime
         startedPlaying = true
