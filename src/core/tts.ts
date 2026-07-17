@@ -329,10 +329,15 @@ export class TTSPlayer {
 
     try {
       this.audioContext = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
-      if (this.audioContext.state === 'suspended') {
-        await this.audioContext.resume()
+      /* Suspend immediately — currentTime must not advance during
+       * pre-buffering, otherwise process() starts mid-buffer and the
+       * first preBufferSecs of audio are silently consumed. */
+      if (this.audioContext.state === 'running') {
+        await this.audioContext.suspend()
+      } else if (this.audioContext.state === 'suspended') {
+        /* already suspended (Chrome autoplay) — leave it */
       }
-      this.playStartTime = this.audioContext.currentTime
+      this.playStartTime = 0
       this.samplesSent = 0
       this.lastProgressTime = 0
       this.userPaused = false
@@ -394,12 +399,10 @@ export class TTSPlayer {
       let leftover: Uint8Array | null = null
       let startedPlaying = false
 
-      const maybeStart = () => {
+      const maybeStart = async () => {
         if (startedPlaying || !this.workletNode || !this.audioContext) return
         if (this.samplesSent < preBufferSamples) return
-        if (this.audioContext.state !== 'running') {
-          this.audioContext.resume()
-        }
+        await this.audioContext.resume()
         this.workletNode.connect(this.audioContext.destination)
         this.playStartTime = this.audioContext.currentTime
         startedPlaying = true
@@ -457,7 +460,7 @@ export class TTSPlayer {
         this.samplesSent += float32.length
         this.workletNode?.port.postMessage(float32, [float32.buffer])
 
-        maybeStart()
+        await maybeStart()
         checkBuffer()
       }
 
