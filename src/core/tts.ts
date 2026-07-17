@@ -47,6 +47,10 @@ export interface PlaybackProgress {
   bufferedSecs: number
   /** Rough estimate of total audio duration (chars / 4). */
   totalEstimate: number
+  /** Pre-buffer target in seconds. */
+  preBufferTarget: number
+  /** Current phase: buffering / playing / paused. */
+  phase: 'buffering' | 'playing' | 'paused'
 }
 
 export interface TTSPlayerCallbacks {
@@ -292,20 +296,29 @@ export class TTSPlayer {
 
   private emitProgress() {
     if (!this.audioContext) return
-    const now = performance.now()
+    const now = Date.now()
     if (now - this.lastProgressTime < PROGRESS_INTERVAL) return
     this.lastProgressTime = now
 
+    const buffered = this.samplesSent / TTS_SAMPLE_RATE
     const played =
       this.audioContext.state === 'running'
-        ? this.audioContext.currentTime - this.playStartTime
+        ? Math.max(0, this.audioContext.currentTime - this.playStartTime)
         : 0
+    const preBuf = this.config.preBufferSecs ?? 30
 
     this.callbacks.onProgress?.({
       text: this.currentText,
-      playedSecs: Math.max(0, played),
-      bufferedSecs: Math.max(0, this.samplesSent / TTS_SAMPLE_RATE - played),
+      playedSecs: played,
+      bufferedSecs: Math.max(0, buffered - played),
       totalEstimate: this.currentText.length / 4,
+      preBufferTarget: preBuf,
+      phase:
+        this.state === 'loading' || this.state === 'buffering'
+          ? 'buffering'
+          : this.state === 'playing'
+          ? 'playing'
+          : 'paused',
     })
   }
 
@@ -462,6 +475,7 @@ export class TTSPlayer {
 
         await maybeStart()
         await checkBuffer()
+        this.emitProgress()
       }
 
       // --- stream ended ---

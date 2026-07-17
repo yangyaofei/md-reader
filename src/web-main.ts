@@ -529,8 +529,7 @@ async function initMarkdownPage(
             ttsBtn.hide()
             ttsPauseBtn.show()
             ttsPauseBtn.innerHTML = PAUSE_SVG
-            ttsPauseBtn.ele.title =
-              state === 'loading' ? 'Loading...' : 'Buffering...'
+            ttsPauseBtn.ele.title = 'Buffering...'
             ttsStopBtn.show()
             break
           case 'playing':
@@ -548,14 +547,10 @@ async function initMarkdownPage(
             ttsStopBtn.show()
             break
         }
-        /* progress bar visibility */
+        /* progress bar visibility: show from loading onwards */
         const el = document.getElementById('md-reader__tts-progress')
         if (el) {
-          el.style.display =
-            state === 'playing' || state === 'paused' || state === 'buffering'
-              ? ''
-              : 'none'
-          if (state === 'buffering') el.textContent = '⏳ Buffering...'
+          el.style.display = state !== 'idle' ? '' : 'none'
         }
       },
       onError: msg => {
@@ -563,7 +558,16 @@ async function initMarkdownPage(
       },
       onProgress: (p: PlaybackProgress) => {
         const el = document.getElementById('md-reader__tts-progress')
-        if (el && p.playedSecs > 0) {
+        if (!el) return
+        if (p.phase === 'buffering') {
+          const bufPct = Math.min(
+            100,
+            Math.round((p.bufferedSecs / p.preBufferTarget) * 100),
+          )
+          el.textContent = `⏳ Buffering ${bufPct}% (${p.bufferedSecs.toFixed(
+            0,
+          )}s / ${p.preBufferTarget}s)`
+        } else if (p.playedSecs > 0) {
           el.textContent = `🔊 ${formatTime(p.playedSecs)} / ~${formatTime(
             p.totalEstimate,
           )} | ${p.text.slice(0, 40)}...`
