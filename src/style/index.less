@@ -641,3 +641,23 @@ body.md-reader {
     }
   }
 }
+
+/* ---- TTS progress indicator ---- */
+.md-reader__tts-progress {
+  position: fixed;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--color-bg, #fff);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-side-border);
+  border-radius: 8px;
+  padding: 6px 16px;
+  font-size: 12px;
+  opacity: 0.85;
+  z-index: 100;
+  white-space: nowrap;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

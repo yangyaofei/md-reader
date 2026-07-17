@@ -17,6 +17,7 @@ import {
   type TTSState,
   type TTSConfig,
   type RemoteVoice,
+  type PlaybackProgress,
 } from '@/core/tts'
 import '@/style/index.less'
 import throttle from 'lodash.throttle'
@@ -513,46 +514,78 @@ async function initMarkdownPage(
   ttsSettingsBtn.innerHTML = SETTINGS_SVG
   ttsSettingsBtn.on('click', () => openTTSModal())
 
-  function updateTTSButtons(state: TTSState) {
-    switch (state) {
-      case 'idle':
-        ttsBtn.show()
-        ttsPauseBtn.hide()
-        ttsStopBtn.hide()
-        break
-      case 'loading':
-        ttsBtn.hide()
-        ttsPauseBtn.show()
-        ttsPauseBtn.innerHTML = PAUSE_SVG
-        ttsPauseBtn.ele.title = 'Loading...'
-        ttsStopBtn.show()
-        break
-      case 'playing':
-        ttsBtn.hide()
-        ttsPauseBtn.show()
-        ttsPauseBtn.innerHTML = PAUSE_SVG
-        ttsPauseBtn.ele.title = 'Pause'
-        ttsStopBtn.show()
-        break
-      case 'paused':
-        ttsBtn.hide()
-        ttsPauseBtn.show()
-        ttsPauseBtn.innerHTML = PLAY_SVG
-        ttsPauseBtn.ele.title = 'Resume'
-        ttsStopBtn.show()
-        break
-    }
-  }
-
   const ttsPlayer = new TTSPlayer(
     {
-      onStateChange: updateTTSButtons,
+      onStateChange: (state: TTSState) => {
+        /* button visibility */
+        switch (state) {
+          case 'idle':
+            ttsBtn.show()
+            ttsPauseBtn.hide()
+            ttsStopBtn.hide()
+            break
+          case 'loading':
+          case 'buffering':
+            ttsBtn.hide()
+            ttsPauseBtn.show()
+            ttsPauseBtn.innerHTML = PAUSE_SVG
+            ttsPauseBtn.ele.title =
+              state === 'loading' ? 'Loading...' : 'Buffering...'
+            ttsStopBtn.show()
+            break
+          case 'playing':
+            ttsBtn.hide()
+            ttsPauseBtn.show()
+            ttsPauseBtn.innerHTML = PAUSE_SVG
+            ttsPauseBtn.ele.title = 'Pause'
+            ttsStopBtn.show()
+            break
+          case 'paused':
+            ttsBtn.hide()
+            ttsPauseBtn.show()
+            ttsPauseBtn.innerHTML = PLAY_SVG
+            ttsPauseBtn.ele.title = 'Resume'
+            ttsStopBtn.show()
+            break
+        }
+        /* progress bar visibility */
+        const el = document.getElementById('md-reader__tts-progress')
+        if (el) {
+          el.style.display =
+            state === 'playing' || state === 'paused' || state === 'buffering'
+              ? ''
+              : 'none'
+          if (state === 'buffering') el.textContent = '⏳ Buffering...'
+        }
+      },
       onError: msg => {
         console.error('TTS error:', msg)
+      },
+      onProgress: (p: PlaybackProgress) => {
+        const el = document.getElementById('md-reader__tts-progress')
+        if (el && p.playedSecs > 0) {
+          el.textContent = `🔊 ${formatTime(p.playedSecs)} / ~${formatTime(
+            p.totalEstimate,
+          )} | ${p.text.slice(0, 40)}...`
+        }
       },
     },
     ttsConfig,
   )
+
+  /* ---- Progress indicator (inserted before the article content) ---- */
+  const progressEl = document.createElement('div')
+  progressEl.id = 'md-reader__tts-progress'
+  progressEl.className = 'md-reader__tts-progress'
+  progressEl.style.display = 'none'
+  document.body.appendChild(progressEl)
+
+  function formatTime(s: number): string {
+    if (s <= 0 || !isFinite(s)) return '0:00'
+    const m = Math.floor(s / 60)
+    const sec = Math.floor(s % 60)
+    return `${m}:${sec.toString().padStart(2, '0')}`
+  }
 
   /* ---- TTS Settings modal ---- */
   let ttsModal: Ele<HTMLElement> | null = null
@@ -589,6 +622,7 @@ async function initMarkdownPage(
     const modelVal = saved.model || ''
     const voiceVal = saved.voice || ''
     const speedVal = saved.speed ?? 1
+    const preBufVal = saved.preBufferSecs ?? 30
 
     /* Build model <option>s */
     const modelOptions = serverModels
@@ -668,6 +702,10 @@ async function initMarkdownPage(
           `Speed: <span data-key="speedLabel">${speedVal.toFixed(1)}x</span>`,
           `<input type="range" data-key="speed" min="0.5" max="2" step="0.1" value="${speedVal}" />`,
         )}
+        ${field(
+          `Pre-buffer: <span data-key="preBufLabel">${preBufVal}s</span>`,
+          `<input type="range" data-key="preBufferSecs" min="5" max="120" step="5" value="${preBufVal}" />`,
+        )}
       </div>
       <div class="${className.TTS_MODAL}__footer">
         <button class="${className.TTS_MODAL}__btn--save">Save</button>
@@ -696,6 +734,14 @@ async function initMarkdownPage(
     const speedLabel = panel.querySelector('[data-key="speedLabel"]')!
     speedInput.addEventListener('input', () => {
       speedLabel.textContent = parseFloat(speedInput.value).toFixed(1) + 'x'
+    })
+
+    const preBufInput = panel.querySelector(
+      '[data-key="preBufferSecs"]',
+    ) as HTMLInputElement
+    const preBufLabel = panel.querySelector('[data-key="preBufLabel"]')!
+    preBufInput.addEventListener('input', () => {
+      preBufLabel.textContent = preBufInput.value + 's'
     })
 
     /* Refresh voices/models when apiUrl or apiKey changes */
@@ -770,6 +816,9 @@ async function initMarkdownPage(
         })
         const speed = parseFloat(speedInput.value)
         if (!isNaN(speed) && speed > 0) newConfig.speed = speed
+        const preBuf = parseInt(preBufInput.value, 10)
+        if (!isNaN(preBuf) && preBuf > 0)
+          (newConfig as any).preBufferSecs = preBuf
 
         saveTTSConfig(newConfig)
         ttsPlayer.updateConfig(newConfig)
