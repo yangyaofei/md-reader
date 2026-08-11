@@ -18,6 +18,7 @@ import {
   type TTSConfig,
   type RemoteVoice,
   type PlaybackProgress,
+  type Sentence,
 } from '@/core/tts'
 import '@/style/index.less'
 import throttle from 'lodash.throttle'
@@ -552,9 +553,18 @@ async function initMarkdownPage(
         if (el) {
           el.style.display = state !== 'idle' ? '' : 'none'
         }
+        if (state === 'idle') {
+          unwrapSentences(mdContent.ele)
+        }
       },
       onError: msg => {
         console.error('TTS error:', msg)
+      },
+      onSentences: (sentences: Sentence[]) => {
+        wrapSentences(mdContent.ele, sentences)
+      },
+      onSentenceChange: (idx: number) => {
+        highlightSentence(idx)
       },
       onProgress: (p: PlaybackProgress) => {
         const el = document.getElementById('md-reader__tts-progress')
@@ -564,13 +574,15 @@ async function initMarkdownPage(
             100,
             Math.round((p.bufferedSecs / p.preBufferTarget) * 100),
           )
-          el.textContent = `⏳ Buffering ${bufPct}% (${p.bufferedSecs.toFixed(
-            0,
-          )}s / ${p.preBufferTarget}s)`
-        } else if (p.playedSecs > 0) {
-          el.textContent = `🔊 ${formatTime(p.playedSecs)} / ~${formatTime(
-            p.totalEstimate,
-          )} | ${p.text.slice(0, 40)}...`
+          el.textContent = `⏳ ${formatSentence(
+            p,
+          )} Buffering ${bufPct}% (${p.bufferedSecs.toFixed(0)}s / ${
+            p.preBufferTarget
+          }s)`
+        } else if (p.playedSecs > 0 || p.sentenceTotal > 0) {
+          el.textContent = `🔊 ${formatSentence(p)}  ${formatTime(
+            p.playedSecs,
+          )} / ~${formatTime(p.totalEstimate)} | ${p.text.slice(0, 30)}...`
         }
       },
     },
@@ -590,6 +602,182 @@ async function initMarkdownPage(
     const sec = Math.floor(s % 60)
     return `${m}:${sec.toString().padStart(2, '0')}`
   }
+
+  function formatSentence(p: PlaybackProgress): string {
+    const total = p.sentenceTotal || 0
+    if (!total) return ''
+    const idx = Math.min(p.sentenceIndex + 1, total)
+    return `第 ${idx}/${total} 句`
+  }
+
+  /* ---- sentence DOM wrapping + highlight ---- */
+  const SENTENCE_ACTIVE_CLS = className.TTS_SENTENCE + '--active'
+  const SENTENCE_SKIP =
+    'pre, img, svg, table, .md-reader__head-anchor, .md-reader__btn--copy'
+
+  function isWs(ch: string): boolean {
+    return (
+      ch === ' ' ||
+      ch === '\t' ||
+      ch === '\n' ||
+      ch === '\r' ||
+      ch === '\f' ||
+      ch === '\v'
+    )
+  }
+
+  function collectReadableTextNodes(root: HTMLElement): Text[] {
+    const out: Text[] = []
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(n: Text) {
+        let p: Element | null = n.parentElement
+        while (p && p !== root) {
+          if (p.matches && p.matches(SENTENCE_SKIP))
+            return NodeFilter.FILTER_REJECT
+          p = p.parentElement
+        }
+        return n.nodeValue && n.nodeValue.length
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_REJECT
+      },
+    })
+    let cur: Node | null
+    while ((cur = walker.nextNode())) out.push(cur as Text)
+    return out
+  }
+
+  /** Remove existing sentence wrappers (move children out, merge text nodes). */
+  function unwrapSentences(root: HTMLElement) {
+    root.querySelectorAll('.' + className.TTS_SENTENCE).forEach(span => {
+      const parent = span.parentNode
+      if (!parent) return
+      while (span.firstChild) parent.insertBefore(span.firstChild, span)
+      parent.removeChild(span)
+    })
+    root.normalize()
+  }
+
+  /**
+   * Wrap each sentence's original text in <span class="tts-sentence">.
+   *
+   * extractTextForTTS normalizes whitespace, so original strings rarely
+   * match raw DOM text.  We align on the non-whitespace character stream
+   * (normalization only changes whitespace counts/positions, never the
+   * relative order of non-ws chars), locate sentence boundaries on that
+   * stream, then map back to text-node char offsets and wrap right-to-left
+   * so earlier wrapping doesn't invalidate later node references.
+   */
+  function wrapSentences(root: HTMLElement, sentences: Sentence[]) {
+    unwrapSentences(root)
+    if (!sentences.length) return
+
+    const nodes = collectReadableTextNodes(root)
+    if (!nodes.length) return
+
+    const prefix: number[] = new Array(nodes.length)
+    let acc = 0
+    for (let i = 0; i < nodes.length; i++) {
+      prefix[i] = acc
+      const t = nodes[i].nodeValue || ''
+      for (let j = 0; j < t.length; j++) if (!isWs(t[j])) acc++
+    }
+    const totalNonWs = acc
+
+    let pos = 0
+    const bounds = sentences.map(s => {
+      let len = 0
+      for (const ch of s.original) if (!isWs(ch)) len++
+      const b = { start: pos, end: pos + len }
+      pos += len
+      return b
+    })
+
+    const locate = (off: number): { ni: number; co: number } | null => {
+      if (off <= 0) return { ni: 0, co: 0 }
+      if (off >= totalNonWs) {
+        const last = nodes.length - 1
+        return { ni: last, co: (nodes[last].nodeValue || '').length }
+      }
+      let lo = 0,
+        hi = nodes.length - 1,
+        idx = 0
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        const nextStart = mid + 1 < nodes.length ? prefix[mid + 1] : totalNonWs
+        if (prefix[mid] <= off && off < nextStart) {
+          idx = mid
+          break
+        }
+        if (prefix[mid] > off) hi = mid - 1
+        else lo = mid + 1
+      }
+      const k = off - prefix[idx]
+      const text = nodes[idx].nodeValue || ''
+      let count = 0
+      for (let co = 0; co < text.length; co++) {
+        if (!isWs(text[co])) {
+          if (count === k) return { ni: idx, co }
+          count++
+        }
+      }
+      return null
+    }
+
+    /* right-to-left so wrapping doesn't shift earlier node offsets */
+    for (let i = sentences.length - 1; i >= 0; i--) {
+      const s = locate(bounds[i].start)
+      const e = locate(bounds[i].end)
+      if (!s || !e) continue
+      const span = document.createElement('span')
+      span.className = className.TTS_SENTENCE
+      span.dataset.idx = String(i)
+      try {
+        const range = document.createRange()
+        range.setStart(nodes[s.ni], s.co)
+        range.setEnd(nodes[e.ni], e.co)
+        try {
+          range.surroundContents(span)
+        } catch (_) {
+          /* surroundContents rejects partially-contained nodes; fall back
+           * to extract+insert which handles cross-node ranges. */
+          const r2 = document.createRange()
+          r2.setStart(nodes[s.ni], s.co)
+          r2.setEnd(nodes[e.ni], e.co)
+          const contents = r2.extractContents()
+          span.appendChild(contents)
+          r2.insertNode(span)
+        }
+      } catch (_) {
+        /* skip this sentence on any failure */
+      }
+    }
+  }
+
+  function highlightSentence(idx: number) {
+    const root = mdContent.ele
+    const prev = root.querySelector('.' + SENTENCE_ACTIVE_CLS)
+    if (prev) prev.classList.remove(SENTENCE_ACTIVE_CLS)
+    const target = root.querySelector(
+      `.${className.TTS_SENTENCE}[data-idx="${idx}"]`,
+    )
+    if (target) {
+      target.classList.add(SENTENCE_ACTIVE_CLS)
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }
+
+  /* click any sentence span to seek playback */
+  mdContent.ele.addEventListener('click', (ev: MouseEvent) => {
+    const tgt = (ev.target as HTMLElement).closest(
+      '.' + className.TTS_SENTENCE,
+    ) as HTMLElement | null
+    if (!tgt) return
+    const idx = parseInt(tgt.dataset.idx || '', 10)
+    if (!isNaN(idx)) {
+      ev.preventDefault()
+      ttsPlayer.seekTo(idx)
+    }
+  })
 
   /* ---- TTS Settings modal ---- */
   let ttsModal: Ele<HTMLElement> | null = null

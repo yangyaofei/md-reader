@@ -661,3 +661,18 @@ body.md-reader {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.md-reader__tts-sentence {
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+
+  &:hover {
+    background: rgba(125, 125, 125, 0.18);
+  }
+
+  &--active {
+    background: rgba(59, 130, 246, 0.28);
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.45);
+  }
+}
