@@ -259,13 +259,10 @@ app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
   const abortCtrl = new AbortController()
   let pipeStarted = false
   const cleanup = () => {
-    abortCtrl.abort()
-    if (ttsRes && pipeStarted) {
-      try {
-        ttsRes.body.cancel()
-      } catch (_) {
-        /* noop */
-      }
+    try {
+      abortCtrl.abort()
+    } catch (_) {
+      /* noop */
     }
   }
   // Express 5: req.on('close') 在请求体读取后就触发（不是客户端断开）。
@@ -301,7 +298,9 @@ app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
   pipeStarted = true
 
   try {
-    Readable.fromWeb(ttsRes.body).pipe(res)
+    const body = Readable.fromWeb(ttsRes.body)
+    body.on('error', () => {})
+    body.pipe(res)
   } catch (e) {
     cleanup()
     if (!res.headersSent) {
