@@ -27,8 +27,12 @@ export interface TTSConfig {
   speed: number
   /** (已弃用, 逐句模式靠窗口预取) 保留兼容。 */
   preBufferSecs: number
-  /** 滑动窗口大小 (默认 5): 当前句 + 后 N 句保持已转换+已合成。 */
-  windowSize: number
+  /** TTS PCM 缓存窗口 (默认 5): 当前句 + 后 N 句保持已合成 PCM。 */
+  audioWindowSize: number
+  /** normalize 领前窗口 (默认 15, >= 2*audioWindowSize): 预取归一化文本, 保证 TTS 不等 normalize。 */
+  normalizeWindowSize: number
+  /** (已弃用) 旧名单窗口, 读取时 fallback 到 audioWindowSize。 */
+  windowSize?: number
 }
 
 export interface RemoteVoice {
@@ -338,7 +342,10 @@ export class TTSPlayer {
   private sentences: Sentence[] = []
   private currentIndex = 0
   private lastReportedIndex = -1
-  private windowSize = 5
+  private audioWindowSize = 5
+  private normalizeWindowSize = 15
+  private normalizing = new Set<number>()
+  private normalizeControllers = new Map<number, AbortController>()
 
   private samplesSent = 0
   private playStartTime = 0
@@ -361,12 +368,17 @@ export class TTSPlayer {
   ) {
     this.callbacks = callbacks
     this.config = config
-    this.windowSize = config.windowSize ?? 5
+    this.audioWindowSize = config.audioWindowSize ?? config.windowSize ?? 5
+    this.normalizeWindowSize = config.normalizeWindowSize ?? 15
   }
 
   updateConfig(config: Partial<TTSConfig>): void {
     this.config = { ...this.config, ...config }
-    if (config.windowSize != null) this.windowSize = config.windowSize
+    if (config.audioWindowSize != null)
+      this.audioWindowSize = config.audioWindowSize
+    else if (config.windowSize != null) this.audioWindowSize = config.windowSize
+    if (config.normalizeWindowSize != null)
+      this.normalizeWindowSize = config.normalizeWindowSize
   }
 
   getState(): TTSState {
@@ -444,13 +456,15 @@ export class TTSPlayer {
     this.abortFetches()
     this.currentIndex = index
     this.lastReportedIndex = -1
+    this.sentenceOffsets = []
     this.workletNode.port.postMessage('flush')
     this.samplesSent = 0
     this.startedPlaying = false
     if (this.audioContext.state === 'running') await this.audioContext.suspend()
     if (this.state !== 'paused') this.setState('loading')
 
-    this.ensureWindow(index)
+    this.ensureNormalize(index)
+    this.ensureAudio(index)
 
     let next = index
     while (next < this.sentences.length) {
@@ -473,7 +487,8 @@ export class TTSPlayer {
       await this.maybeStart()
       this.emitProgress()
       next++
-      this.ensureWindow(next)
+      this.ensureNormalize(next)
+      this.ensureAudio(next)
     }
     if (this.epoch !== myEpoch) return
     this.workletNode?.port.postMessage(null)
@@ -495,17 +510,71 @@ export class TTSPlayer {
   }
 
   /** 预取窗口 [from, from+windowSize): 并发跑 normalize→PCM 整句流水线。 */
-  private ensureWindow(fromIndex: number): void {
-    const end = Math.min(this.sentences.length, fromIndex + this.windowSize)
+  private ensureNormalize(fromIndex: number): void {
+    const end = Math.min(
+      this.sentences.length,
+      fromIndex + this.normalizeWindowSize,
+    )
+    for (let i = fromIndex; i < end; i++) {
+      if (!this.normalizeCache.has(i) && !this.normalizing.has(i)) {
+        this.fetchNormalize(i)
+      }
+    }
+  }
+
+  private ensureAudio(fromIndex: number): void {
+    const end = Math.min(
+      this.sentences.length,
+      fromIndex + this.audioWindowSize,
+    )
     for (let i = fromIndex; i < end; i++) {
       if (!this.audioCache.has(i) && !this.fetching.has(i)) {
-        this.fetchSentenceFull(i)
+        this.fetchAudio(i)
       }
     }
   }
 
   /** 单句完整流水线: normalize → fetch PCM → audioCache。 */
-  private fetchSentenceFull(i: number): void {
+  private fetchNormalize(i: number): void {
+    this.normalizing.add(i)
+    const ctrl = new AbortController()
+    this.normalizeControllers.set(i, ctrl)
+    if (this.masterAbort) {
+      this.masterAbort.signal.addEventListener('abort', () => ctrl.abort())
+    }
+    ;(async () => {
+      try {
+        const ttsText = await normalizeText(
+          this.sentences[i].original,
+          this.config,
+        )
+        if (!ctrl.signal.aborted) this.normalizeCache.set(i, ttsText)
+      } catch (e: any) {
+        if (e?.name === 'AbortError') return
+        this.callbacks.onError?.(`normalize ${i}: ${e?.message || String(e)}`)
+        this.normalizeCache.set(i, this.sentences[i].original)
+      } finally {
+        this.normalizing.delete(i)
+        this.normalizeControllers.delete(i)
+      }
+    })()
+  }
+
+  private async waitForNormalize(i: number, myEpoch: number): Promise<string> {
+    while (this.epoch === myEpoch && !this.normalizeCache.has(i)) {
+      if (
+        this.epoch === myEpoch &&
+        !this.normalizing.has(i) &&
+        !this.normalizeCache.has(i)
+      ) {
+        this.fetchNormalize(i)
+      }
+      await sleep(50)
+    }
+    return this.normalizeCache.get(i) || this.sentences[i]?.original || ''
+  }
+
+  private fetchAudio(i: number): void {
     this.fetching.add(i)
     const ctrl = new AbortController()
     this.sentenceControllers.set(i, ctrl)
@@ -514,16 +583,10 @@ export class TTSPlayer {
     }
     ;(async () => {
       try {
-        /* 第二步: normalize (有 cache 用 cache) */
-        let ttsText = this.normalizeCache.get(i)
-        if (ttsText == null) {
-          ttsText = await normalizeText(this.sentences[i].original, this.config)
-          if (this.epoch >= 0) this.normalizeCache.set(i, ttsText)
-        }
+        const ttsText = await this.waitForNormalize(i, this.epoch)
         if (ctrl.signal.aborted) return
-        /* 第三步: 纯 TTS */
         const pcm = await this.fetchSentencePCM(ttsText, ctrl.signal)
-        this.audioCache.set(i, pcm)
+        if (!ctrl.signal.aborted) this.audioCache.set(i, pcm)
       } catch (e: any) {
         if (e?.name === 'AbortError') return
         this.callbacks.onError?.(`sentence ${i}: ${e?.message || String(e)}`)
@@ -546,7 +609,7 @@ export class TTSPlayer {
         !this.fetching.has(i) &&
         !this.audioCache.has(i)
       ) {
-        this.fetchSentenceFull(i)
+        this.fetchAudio(i)
       }
       await sleep(50)
     }
@@ -554,8 +617,11 @@ export class TTSPlayer {
   }
 
   private abortFetches(): void {
+    for (const ctrl of this.normalizeControllers.values()) ctrl.abort()
     for (const ctrl of this.sentenceControllers.values()) ctrl.abort()
+    this.normalizeControllers.clear()
     this.sentenceControllers.clear()
+    this.normalizing.clear()
     this.fetching.clear()
   }
 
