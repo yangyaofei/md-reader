@@ -525,7 +525,18 @@ async function initMarkdownPage(
             ttsPauseBtn.hide()
             ttsStopBtn.hide()
             break
-          case 'loading':
+          case 'loading': {
+            const el0 = document.getElementById('md-reader__tts-progress')
+            if (el0) {
+              el0.textContent = '⏳ 正在分析文本(分句 + 归一化)...'
+            }
+            ttsBtn.hide()
+            ttsPauseBtn.show()
+            ttsPauseBtn.innerHTML = PAUSE_SVG
+            ttsPauseBtn.ele.title = 'Analyzing...'
+            ttsStopBtn.show()
+            break
+          }
           case 'buffering':
             ttsBtn.hide()
             ttsPauseBtn.show()
