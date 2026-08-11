@@ -1,21 +1,16 @@
 /**
  * Sentence-aware streaming TTS player using AudioWorklet.
  *
- * Purpose: play text-to-speech audio with per-sentence seeking,
- * highlight and sliding-window prefetch.
+ * 三步正交流程 (edge-tts 后端):
+ *   1. split(text)        → sentences[] (纯正则分句, 无归一化)
+ *   2. normalize(sentence) → tts_text    (pydantic-ai 单句转换, 滑动窗口预取)
+ *   3. audio/speech(tts_text) → PCM       (纯 TTS, 无前处理)
  *
- * Design decisions:
- *  - Text is first segmented via /api/tts/segment into Sentence[].
- *  - Each sentence is requested individually (same /api/tts endpoint,
- *    streaming WAV).  A sliding window prefetches the next N sentences
- *    as whole-PCM buffers (strategy A: integral-sentence cache).
- *  - AudioWorklet ring buffer (60 s) receives PCM in sentence order.
- *  - The worklet is NOT aware of sentence boundaries — sentence offsets
- *    (samplesSent before feeding each sentence) let us map the play head
- *    back to the current sentence index.
- *  - seek = abort in-flight fetches + flush ring buffer + restart window.
- *  - Pre-buffer / under-run suspend logic is preserved and works across
- *    sentence boundaries (buffer accumulates over multiple sentences).
+ * 滑动窗口: [currentIndex, currentIndex+N) 并发跑 (normalize → PCM) 整句流水线,
+ * N 句同时在不同阶段, 抵消 LLM 归一化延迟。seekTo(index) 从任意句重启窗口。
+ *
+ * 关键修复: maybeStart 不再等 30s preBuffer (逐句模式单句几秒永远达不到),
+ * 有 PCM 即播放; underrun 靠窗口预取避免, 不 suspend audioContext。
  */
 const TTS_SAMPLE_RATE = 24000
 const WAV_HEADER_SIZE = 44
@@ -30,9 +25,9 @@ export interface TTSConfig {
   model: string
   voice: string
   speed: number
-  /** Seconds of audio to buffer before starting playback (default 30). */
+  /** (已弃用, 逐句模式靠窗口预取) 保留兼容。 */
   preBufferSecs: number
-  /** Sliding-window size in sentences (default 3). */
+  /** 滑动窗口大小 (默认 5): 当前句 + 后 N 句保持已转换+已合成。 */
   windowSize: number
 }
 
@@ -44,29 +39,20 @@ export interface RemoteVoice {
   gender: string
 }
 
-/** A single segmented sentence: original text + normalized TTS text. */
+/** 分句结果: 只含原始文本, ttsText 运行时由 normalize 填充。 */
 export interface Sentence {
   index: number
   original: string
-  ttsText: string
 }
 
 export interface PlaybackProgress {
-  /** Text of the sentence currently being spoken. */
   text: string
-  /** Seconds of audio played so far. */
   playedSecs: number
-  /** Seconds of audio buffered ahead of the play head. */
   bufferedSecs: number
-  /** Rough estimate of total audio duration (chars / 4). */
   totalEstimate: number
-  /** Pre-buffer target in seconds. */
   preBufferTarget: number
-  /** Current phase: buffering / playing / paused. */
   phase: 'buffering' | 'playing' | 'paused'
-  /** Index of the sentence currently being spoken. */
   sentenceIndex: number
-  /** Total number of sentences. */
   sentenceTotal: number
 }
 
@@ -74,9 +60,7 @@ export interface TTSPlayerCallbacks {
   onStateChange?: (state: TTSState) => void
   onError?: (message: string) => void
   onProgress?: (p: PlaybackProgress) => void
-  /** Fires once after segmentation with the full sentence list. */
   onSentences?: (sentences: Sentence[]) => void
-  /** Fires whenever the currently-spoken sentence index changes. */
   onSentenceChange?: (index: number) => void
 }
 
@@ -115,11 +99,6 @@ function normalizeVoice(v: any): RemoteVoice {
   }
 }
 
-/**
- * Fetch models + voices from the TTS API.
- * Calls the TTS API directly when apiUrl+apiKey are configured;
- * falls back to the server proxy /api/tts/config otherwise.
- */
 export async function fetchTTSConfig(config: Partial<TTSConfig>): Promise<{
   models: string[]
   voices: RemoteVoice[]
@@ -154,8 +133,6 @@ export async function fetchTTSConfig(config: Partial<TTSConfig>): Promise<{
       }
     }
   }
-
-  /* Fall back to server proxy */
   try {
     const params = new URLSearchParams()
     if (config.apiUrl) params.set('apiUrl', config.apiUrl)
@@ -173,30 +150,21 @@ export async function fetchTTSConfig(config: Partial<TTSConfig>): Promise<{
   return { models: [], voices: [], serverConfigured: false }
 }
 
-/* ---------- Segmentation ---------- */
+/* ---------- 第一步: split (分句) ---------- */
 
-/**
- * Local-only fallback splitter used when the segment endpoint is
- * unavailable (non-edge-tts backend, offline, etc.).  Produces no
- * normalization — ttsText == original.
- */
-function localSegment(text: string): Sentence[] {
+function localSplit(text: string): Sentence[] {
   const parts = text.match(/[^。!?\n]+[。!?]?\n?/g) || [text]
   const out: Sentence[] = []
   let i = 0
   for (const p of parts) {
     const t = p.trim()
-    if (t) out.push({ index: i++, original: t, ttsText: t })
+    if (t) out.push({ index: i++, original: t })
   }
   return out
 }
 
-/**
- * Segment text into sentences with TTS normalization.
- * Calls the edge-tts /api/v1/tts/segment endpoint (direct or via proxy)
- * and falls back to local splitting on any failure.
- */
-export async function segmentText(
+/** 调 /api/v1/tts/split 分句 (纯正则, 不归一化)。失败 fallback 本地分句。 */
+export async function splitText(
   text: string,
   config: Partial<TTSConfig>,
 ): Promise<Sentence[]> {
@@ -208,35 +176,64 @@ export async function segmentText(
     }
     let url: string
     if (useDirect) {
-      /* apiUrl looks like .../v1/audio/speech (openai router, no prefix).
-       * segment lives under a different router (/api/v1/tts/segment), so
-       * derive it from the tunnel base. */
       url = config.apiUrl!.replace(
         /\/v1\/audio\/speech\/?$/,
-        '/api/v1/tts/segment',
+        '/api/v1/tts/split',
       )
       headers['Authorization'] = `Bearer ${config.apiKey}`
     } else {
-      url = '/api/tts/segment'
+      url = '/api/tts/split'
     }
     const resp = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ text, language: 'chinese', normalize: 'llm' }),
+      body: JSON.stringify({ text }),
     })
-    if (!resp.ok) throw new Error(`segment HTTP ${resp.status}`)
+    if (!resp.ok) throw new Error(`split HTTP ${resp.status}`)
     const data = await resp.json()
     const arr: any[] = data.sentences || []
-    if (!arr.length) return localSegment(text)
-    return arr.map((s, i) => ({
-      index: i,
-      original: s.original ?? '',
-      ttsText: s.tts_text ?? s.original ?? '',
-    }))
+    if (!arr.length) return localSplit(text)
+    return arr.map((s, i) => ({ index: i, original: s.text ?? '' }))
   } catch (e: any) {
-    /* degrade gracefully — never block playback on normalization */
-    console.warn('[TTS] segment failed, fallback to local split:', e)
-    return localSegment(text)
+    console.warn('[TTS] split failed, fallback to local:', e)
+    return localSplit(text)
+  }
+}
+
+/* ---------- 第二步: normalize (单句归一化) ---------- */
+
+/** 调 /api/v1/tts/normalize 单句归一化。失败 fallback 原文。 */
+export async function normalizeText(
+  text: string,
+  config: Partial<TTSConfig>,
+): Promise<string> {
+  if (!text.trim()) return text
+  const useDirect = !!(config.apiUrl && config.apiKey)
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    }
+    let url: string
+    if (useDirect) {
+      url = config.apiUrl!.replace(
+        /\/v1\/audio\/speech\/?$/,
+        '/api/v1/tts/normalize',
+      )
+      headers['Authorization'] = `Bearer ${config.apiKey}`
+    } else {
+      url = '/api/tts/normalize'
+    }
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ text }),
+    })
+    if (!resp.ok) throw new Error(`normalize HTTP ${resp.status}`)
+    const data = await resp.json()
+    return data.tts_text || text
+  } catch (e: any) {
+    console.warn('[TTS] normalize failed, return original:', e)
+    return text
   }
 }
 
@@ -254,16 +251,9 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     this.endedNotified = false
     this.port.onmessage = (e) => {
       const msg = e.data
-      if (msg === null) {
-        this.ended = true
-        return
-      }
+      if (msg === null) { this.ended = true; return }
       if (msg === 'flush') {
-        this.wpos = 0
-        this.rpos = 0
-        this.ended = false
-        this.endedNotified = false
-        return
+        this.wpos = 0; this.rpos = 0; this.ended = false; this.endedNotified = false; return
       }
       if (msg instanceof Float32Array) {
         for (let i = 0; i < msg.length; i++) {
@@ -298,23 +288,17 @@ registerProcessor('pcm-player', PCMPlayerProcessor)
 `
 
 let _workletUrl: string | null = null
-
 function getWorkletUrl(): string {
   if (!_workletUrl) {
-    const blob = new Blob([WORKLET_SOURCE], {
-      type: 'application/javascript',
-    })
-    _workletUrl = URL.createObjectURL(blob)
+    _workletUrl = URL.createObjectURL(
+      new Blob([WORKLET_SOURCE], { type: 'application/javascript' }),
+    )
   }
   return _workletUrl
 }
 
 /* ---------- Helpers ---------- */
 
-/**
- * Extract readable text from a rendered markdown article.
- * Removes code blocks, images, SVGs, tables and anchor links.
- */
 export function extractTextForTTS(element: HTMLElement): string {
   const clone = element.cloneNode(true) as HTMLElement
   clone
@@ -328,14 +312,12 @@ export function extractTextForTTS(element: HTMLElement): string {
     .trim()
 }
 
-/** Convert raw 16-bit little-endian PCM bytes to Float32 samples. */
 function pcmToInt16Float(bytes: Uint8Array): Float32Array {
   const sampleCount = bytes.length >> 1
   const result = new Float32Array(sampleCount)
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  for (let i = 0; i < sampleCount; i++) {
+  for (let i = 0; i < sampleCount; i++)
     result[i] = view.getInt16(i * 2, true) / 32768
-  }
   return result
 }
 
@@ -356,18 +338,18 @@ export class TTSPlayer {
   private sentences: Sentence[] = []
   private currentIndex = 0
   private lastReportedIndex = -1
-  private windowSize = 3
+  private windowSize = 5
 
   private samplesSent = 0
   private playStartTime = 0
-  /** [idx] = sample offset where sentence idx begins (in cumulative stream). */
   private sentenceOffsets: number[] = []
+  /** [idx] = 归一化后的 tts_text (第二步产物)。 */
+  private normalizeCache = new Map<number, string>()
+  /** [idx] = 完整 PCM (第三步产物)。 */
   private audioCache = new Map<number, Float32Array>()
   private fetching = new Set<number>()
   private sentenceControllers = new Map<number, AbortController>()
-  /** Aborted on stop to cancel every in-flight sentence fetch. */
   private masterAbort: AbortController | null = null
-  /** Incremented on play/seek/stop so stale feed loops bail out. */
   private epoch = 0
   private startedPlaying = false
   private userPaused = false
@@ -379,10 +361,9 @@ export class TTSPlayer {
   ) {
     this.callbacks = callbacks
     this.config = config
-    this.windowSize = config.windowSize ?? 3
+    this.windowSize = config.windowSize ?? 5
   }
 
-  /** Update config at runtime (e.g. when user saves settings). */
   updateConfig(config: Partial<TTSConfig>): void {
     this.config = { ...this.config, ...config }
     if (config.windowSize != null) this.windowSize = config.windowSize
@@ -391,7 +372,6 @@ export class TTSPlayer {
   getState(): TTSState {
     return this.state
   }
-
   getSentences(): Sentence[] {
     return this.sentences
   }
@@ -402,20 +382,16 @@ export class TTSPlayer {
     this.callbacks.onStateChange?.(s)
   }
 
-  /**
-   * Begin playback of a full text: segment → setup audio → play from 0.
-   * onSentences fires after segmentation so the UI can wrap the DOM.
-   */
+  /** 播放整篇: split → setup → playFrom(0)。 */
   async play(text: string): Promise<void> {
     if (!text.trim()) return
     this.stopInternal()
     this.currentText = text
     this.setState('loading')
-
     try {
-      this.sentences = await segmentText(text, this.config)
+      this.sentences = await splitText(text, this.config)
     } catch (e: any) {
-      this.callbacks.onError?.('segment: ' + (e.message || String(e)))
+      this.callbacks.onError?.('split: ' + (e.message || String(e)))
       this.setState('idle')
       return
     }
@@ -424,13 +400,12 @@ export class TTSPlayer {
       return
     }
     this.callbacks.onSentences?.(this.sentences)
-
     await this.setupAudio()
     if (!this.audioContext || !this.workletNode) return
     await this.playFrom(0)
   }
 
-  /** Seek to a sentence: abort in-flight, flush buffer, restart window. */
+  /** 从任意句开始: abort + flush + 重启窗口。 */
   async seekTo(index: number): Promise<void> {
     if (index < 0 || index >= this.sentences.length) return
     if (!this.audioContext || !this.workletNode) return
@@ -440,11 +415,7 @@ export class TTSPlayer {
 
   private async setupAudio(): Promise<void> {
     this.audioContext = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
-    /* Suspend immediately — currentTime must not advance during
-     * pre-buffering, otherwise process() consumes the first chunk silently. */
-    if (this.audioContext.state === 'running') {
-      await this.audioContext.suspend()
-    }
+    if (this.audioContext.state === 'running') await this.audioContext.suspend()
     this.playStartTime = 0
     this.samplesSent = 0
     this.lastProgressTime = 0
@@ -452,8 +423,8 @@ export class TTSPlayer {
     this.startedPlaying = false
     this.sentenceOffsets = []
     this.audioCache.clear()
+    this.normalizeCache.clear()
     this.lastReportedIndex = -1
-
     await this.audioContext.audioWorklet.addModule(getWorkletUrl())
     this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-player')
     this.workletNode.port.onmessage = (e: MessageEvent) => {
@@ -465,11 +436,9 @@ export class TTSPlayer {
     this.masterAbort = new AbortController()
   }
 
-  /** Drive playback starting at `index`. Owns the feed loop. */
+  /** 驱动播放: 从 index 开始喂入循环。 */
   private async playFrom(index: number): Promise<void> {
     if (!this.audioContext || !this.workletNode) return
-
-    /* Cancel any previous feed loop + in-flight fetches, flush residue. */
     this.epoch++
     const myEpoch = this.epoch
     this.abortFetches()
@@ -478,9 +447,7 @@ export class TTSPlayer {
     this.workletNode.port.postMessage('flush')
     this.samplesSent = 0
     this.startedPlaying = false
-    if (this.audioContext.state === 'running') {
-      await this.audioContext.suspend()
-    }
+    if (this.audioContext.state === 'running') await this.audioContext.suspend()
     if (this.state !== 'paused') this.setState('loading')
 
     this.ensureWindow(index)
@@ -488,74 +455,88 @@ export class TTSPlayer {
     let next = index
     while (next < this.sentences.length) {
       if (this.epoch !== myEpoch) return
-      const pcm = await this.waitForSentence(next, myEpoch)
+      const pcm = await this.waitForAudio(next, myEpoch)
       if (this.epoch !== myEpoch) return
       if (!this.workletNode || !this.audioContext) return
-
       this.sentenceOffsets[next] = this.samplesSent
       if (pcm.length > 0) {
-        this.workletNode.port.postMessage(pcm, [pcm.buffer])
+        /* Read pcm.length BEFORE postMessage transfers the buffer —
+         * a transferred ArrayBuffer detaches the view, after which
+         * TypedArray.length returns 0 (byteLength becomes 0). */
         this.samplesSent += pcm.length
+        try {
+          this.workletNode.port.postMessage(pcm, [pcm.buffer])
+        } catch (_) {
+          /* noop — buffer transfer failure shouldn't crash playback */
+        }
       }
       await this.maybeStart()
-      await this.checkBuffer()
       this.emitProgress()
       next++
       this.ensureWindow(next)
     }
-
     if (this.epoch !== myEpoch) return
-    /* All sentences fed — signal end of stream. */
     this.workletNode?.port.postMessage(null)
-
-    /* Wait for the tail to finish playing (worklet fires 'ended'). */
+    /* 等尾音播完 (worklet fires 'ended')。 */
     while (
       (this.state === 'playing' || this.state === 'buffering') &&
       this.epoch === myEpoch
     ) {
-      if (this.state === 'buffering' && this.audioContext) {
+      if (
+        this.state === 'buffering' &&
+        this.audioContext &&
+        this.startedPlaying
+      ) {
         await this.audioContext.resume()
-        this.setState('playing')
       }
       await sleep(300)
       this.emitProgress()
     }
   }
 
-  /** Prefetch the window [fromIndex, fromIndex+windowSize). */
+  /** 预取窗口 [from, from+windowSize): 并发跑 normalize→PCM 整句流水线。 */
   private ensureWindow(fromIndex: number): void {
     const end = Math.min(this.sentences.length, fromIndex + this.windowSize)
     for (let i = fromIndex; i < end; i++) {
       if (!this.audioCache.has(i) && !this.fetching.has(i)) {
-        this.fetchSentence(i)
+        this.fetchSentenceFull(i)
       }
     }
   }
 
-  private fetchSentence(i: number): void {
+  /** 单句完整流水线: normalize → fetch PCM → audioCache。 */
+  private fetchSentenceFull(i: number): void {
     this.fetching.add(i)
     const ctrl = new AbortController()
     this.sentenceControllers.set(i, ctrl)
     if (this.masterAbort) {
       this.masterAbort.signal.addEventListener('abort', () => ctrl.abort())
     }
-    const text = this.sentences[i].ttsText
-    this.fetchSentencePCM(text, ctrl.signal)
-      .then(pcm => this.audioCache.set(i, pcm))
-      .catch((e: any) => {
+    ;(async () => {
+      try {
+        /* 第二步: normalize (有 cache 用 cache) */
+        let ttsText = this.normalizeCache.get(i)
+        if (ttsText == null) {
+          ttsText = await normalizeText(this.sentences[i].original, this.config)
+          if (this.epoch >= 0) this.normalizeCache.set(i, ttsText)
+        }
+        if (ctrl.signal.aborted) return
+        /* 第三步: 纯 TTS */
+        const pcm = await this.fetchSentencePCM(ttsText, ctrl.signal)
+        this.audioCache.set(i, pcm)
+      } catch (e: any) {
         if (e?.name === 'AbortError') return
         this.callbacks.onError?.(`sentence ${i}: ${e?.message || String(e)}`)
-        /* degrade: empty PCM so feed loop advances past the failed sentence */
         this.audioCache.set(i, new Float32Array(0))
-      })
-      .finally(() => {
+      } finally {
         this.fetching.delete(i)
         this.sentenceControllers.delete(i)
-      })
+      }
+    })()
   }
 
-  /** Block until sentence i's PCM is cached (or epoch changes). */
-  private async waitForSentence(
+  /** 阻塞直到句子 i 的 PCM 就绪 (或 epoch 变)。 */
+  private async waitForAudio(
     i: number,
     myEpoch: number,
   ): Promise<Float32Array> {
@@ -565,7 +546,7 @@ export class TTSPlayer {
         !this.fetching.has(i) &&
         !this.audioCache.has(i)
       ) {
-        this.fetchSentence(i)
+        this.fetchSentenceFull(i)
       }
       await sleep(50)
     }
@@ -578,7 +559,7 @@ export class TTSPlayer {
     this.fetching.clear()
   }
 
-  /** Fetch one sentence as a complete Float32 PCM buffer. */
+  /** 第三步: 调 audio/speech 拿单句 PCM (纯 TTS, 无前处理)。 */
   private async fetchSentencePCM(
     text: string,
     signal: AbortSignal,
@@ -604,13 +585,7 @@ export class TTSPlayer {
           ...(this.config.model && { model: this.config.model }),
           ...(speed !== 1 && { speed }),
         })
-
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers,
-      body,
-      signal,
-    })
+    const resp = await fetch(url, { method: 'POST', headers, body, signal })
     if (!resp.ok) {
       const e = await resp
         .json()
@@ -618,7 +593,6 @@ export class TTSPlayer {
       throw new Error(e.error || `HTTP ${resp.status}`)
     }
     if (!resp.body) throw new Error('No response body')
-
     const reader = resp.body.getReader()
     const chunks: Uint8Array[] = []
     let total = 0
@@ -640,8 +614,7 @@ export class TTSPlayer {
         chunk = merged
         leftover = null
       }
-      const odd = chunk.length & 1
-      if (odd) {
+      if (chunk.length & 1) {
         leftover = chunk.slice(chunk.length - 1)
         chunk = chunk.slice(0, chunk.length - 1)
       }
@@ -663,10 +636,10 @@ export class TTSPlayer {
     return pcmToInt16Float(merged)
   }
 
+  /** 有 PCM 即播放 (不再等 30s preBuffer —— 逐句模式靠窗口预取避免 underrun)。 */
   private async maybeStart(): Promise<void> {
     if (this.startedPlaying || !this.workletNode || !this.audioContext) return
-    const preBuffer = this.config.preBufferSecs ?? 30
-    if (this.samplesSent < preBuffer * TTS_SAMPLE_RATE) return
+    if (this.samplesSent === 0) return
     await this.audioContext.resume()
     this.workletNode.connect(this.audioContext.destination)
     this.playStartTime = this.audioContext.currentTime
@@ -675,42 +648,16 @@ export class TTSPlayer {
     this.emitProgress()
   }
 
-  private async checkBuffer(): Promise<void> {
-    if (!this.audioContext || !this.startedPlaying || this.userPaused) return
-    const preBuffer = this.config.preBufferSecs ?? 30
-    const played =
-      this.audioContext.state === 'running'
-        ? this.audioContext.currentTime - this.playStartTime
-        : 0
-    const buffered = this.samplesSent / TTS_SAMPLE_RATE - played
-
-    if (this.state === 'playing' && buffered < preBuffer * 0.5) {
-      await this.audioContext.suspend()
-      this.setState('buffering')
-    } else if (this.state === 'buffering' && buffered >= preBuffer) {
-      await this.audioContext.resume()
-      this.playStartTime = this.audioContext.currentTime - played
-      this.setState('playing')
-      this.emitProgress()
-    } else if (this.state === 'playing') {
-      this.emitProgress()
-    }
-  }
-
   private emitProgress(): void {
     if (!this.audioContext) return
     const now = Date.now()
     if (now - this.lastProgressTime < PROGRESS_INTERVAL) return
     this.lastProgressTime = now
-
-    const preBuf = this.config.preBufferSecs ?? 30
     const buffered = this.samplesSent / TTS_SAMPLE_RATE
     const played =
-      this.audioContext.state === 'running'
+      this.audioContext.state === 'running' && this.startedPlaying
         ? Math.max(0, this.audioContext.currentTime - this.playStartTime)
         : 0
-
-    /* Find the sentence whose offset is the greatest <= played samples. */
     let curIdx = this.currentIndex
     for (let i = this.sentenceOffsets.length - 1; i >= 0; i--) {
       const off = this.sentenceOffsets[i]
@@ -723,13 +670,12 @@ export class TTSPlayer {
       this.lastReportedIndex = curIdx
       this.callbacks.onSentenceChange?.(curIdx)
     }
-
     this.callbacks.onProgress?.({
       text: this.sentences[curIdx]?.original || this.currentText,
       playedSecs: played,
       bufferedSecs: Math.max(0, buffered - played),
       totalEstimate: this.currentText.length / 4,
-      preBufferTarget: preBuf,
+      preBufferTarget: this.config.preBufferSecs ?? 0,
       phase:
         this.state === 'loading' || this.state === 'buffering'
           ? 'buffering'
@@ -741,34 +687,26 @@ export class TTSPlayer {
     })
   }
 
-  /** Pause playback (user-initiated). */
   pause(): void {
     if (this.state !== 'playing') return
     this.userPaused = true
     this.audioContext?.suspend()
     this.setState('paused')
   }
-
-  /** Resume playback (user-initiated). */
   resume(): void {
     if (this.state !== 'paused') return
     this.userPaused = false
     this.audioContext?.resume()
     this.setState('playing')
   }
-
-  /** Toggle pause/resume. */
   togglePause(): void {
     if (this.state === 'playing') this.pause()
     else if (this.state === 'paused') this.resume()
   }
-
-  /** Stop playback and release all resources. */
   stop(): void {
     this.stopInternal()
     this.setState('idle')
   }
-
   private stopInternal(): void {
     this.epoch++
     this.abortFetches()
@@ -778,7 +716,6 @@ export class TTSPlayer {
     }
     this.cleanup()
   }
-
   private cleanup(): void {
     if (this.workletNode) {
       try {
@@ -794,6 +731,7 @@ export class TTSPlayer {
     }
     this.sentences = []
     this.audioCache.clear()
+    this.normalizeCache.clear()
     this.startedPlaying = false
   }
 }
