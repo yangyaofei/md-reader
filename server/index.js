@@ -177,6 +177,57 @@ app.get('/api/tts/config', async (req, res) => {
   }
 })
 
+/* Segment + normalize proxy.  Forwards to edge-tts /api/v1/tts/segment.
+ * Path derivation: audio/speech (openai router, no prefix) -> /v1/audio/speech;
+ * segment (tts router, prefix /api/v1) -> /api/v1/tts/segment.  Both share the
+ * same tunnel base, so strip the audio/speech suffix and append the segment path. */
+app.post(
+  '/api/tts/segment',
+  express.json({ limit: '2mb' }),
+  async (req, res) => {
+    const { text, language, normalize, apiUrl, apiKey } = req.body || {}
+    if (text == null || typeof text !== 'string') {
+      return res.status(400).json({ error: 'text is required' })
+    }
+    if (text.trim() === '') {
+      return res.json({ sentences: [] })
+    }
+    const base = (apiUrl || TTS_API_URL || '').replace(
+      /\/v1\/audio\/speech\/?$/,
+      '',
+    )
+    const segUrl = base + '/api/v1/tts/segment'
+    const key = apiKey || TTS_API_KEY
+    if (!base || !key) {
+      return res.status(503).json({
+        error:
+          'TTS segment endpoint not configured (set apiUrl/apiKey in Settings, or TTS_API_URL/TTS_API_KEY on the server).',
+      })
+    }
+    try {
+      const upstream = await fetch(segUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text,
+          language: language || 'chinese',
+          normalize: normalize || 'llm',
+        }),
+      })
+      const data = await upstream.json()
+      if (!upstream.ok) return res.status(upstream.status).json(data)
+      return res.json(data)
+    } catch (e) {
+      return res
+        .status(502)
+        .json({ error: 'segment upstream unreachable: ' + e.message })
+    }
+  },
+)
+
 app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
   const { text, voice, speed, apiUrl, apiKey, model } = req.body || {}
 
