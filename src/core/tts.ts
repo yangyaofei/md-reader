@@ -412,6 +412,8 @@ export class TTSPlayer {
         /* 后台预取 normalize (前 N 句) */
         if (!this.masterAbort) this.masterAbort = new AbortController()
         this.ensureNormalize(0)
+        /* 立即包裹 DOM — 用户进页面就能看到句子结构 + 点击 seek */
+        this.callbacks.onSentences?.(sentences)
         return sentences
       })
       .catch(e => {
@@ -440,6 +442,7 @@ export class TTSPlayer {
         /* noop */
       }
       this.preloadPromise = null
+      /* DOM 已被 preload 的 onSentences 包裹, 不重复 */
     } else if (!sameText || this.sentences.length === 0) {
       this.preloadPromise = null
       try {
@@ -449,12 +452,12 @@ export class TTSPlayer {
         this.setState('idle')
         return
       }
+      this.callbacks.onSentences?.(this.sentences)
     }
     if (!this.sentences.length) {
       this.setState('idle')
       return
     }
-    this.callbacks.onSentences?.(this.sentences)
     await this.playFrom(0)
   }
 
