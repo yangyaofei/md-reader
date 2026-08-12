@@ -349,6 +349,10 @@ export class TTSPlayer {
 
   private samplesSent = 0
   private playStartTime = 0
+  /** Accumulated played seconds before current resume (survives suspend). */
+  private totalPlayed = 0
+  /** currentTime at last resume — added to totalPlayed for live played. */
+  private lastResumeTime = 0
   private sentenceOffsets: number[] = []
   /** [idx] = 归一化后的 tts_text (第二步产物)。 */
   private normalizeCache = new Map<number, string>()
@@ -422,8 +426,8 @@ export class TTSPlayer {
       })
   }
 
-  /** 播放整篇: setup → split (或复用 preload) → playFrom(0)。 */
-  async play(text: string): Promise<void> {
+  /** 播放整篇: setup → split (或复用 preload) → playFrom(startIdx)。 */
+  async play(text: string, startIdx?: number): Promise<void> {
     if (!text.trim()) return
     const sameText = this.currentText === text
 
@@ -458,7 +462,7 @@ export class TTSPlayer {
       this.setState('idle')
       return
     }
-    await this.playFrom(0)
+    await this.playFrom(startIdx ?? 0)
   }
 
   /** 从任意句开始: abort + flush + 重启窗口。 */
@@ -682,7 +686,9 @@ export class TTSPlayer {
     text: string,
     signal: AbortSignal,
   ): Promise<void> {
-    if (!text.trim()) return
+    /* 去除 normalize 加的拼音标注 (TTS 引擎会当文本读) */
+    const cleanText = text.replace(/\([a-zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ ]+\)/gi, '')
+    if (!cleanText.trim()) return
     const useDirect = !!(this.config.apiUrl && this.config.apiKey)
     const url = useDirect ? this.config.apiUrl! : '/api/tts'
     const headers: Record<string, string> = {
@@ -693,12 +699,12 @@ export class TTSPlayer {
     const body = useDirect
       ? JSON.stringify({
           model: this.config.model || 'qwen',
-          input: text,
+          input: cleanText,
           voice: this.config.voice || 'alloy',
           ...(speed !== 1 && { speed }),
         })
       : JSON.stringify({
-          text,
+          text: cleanText,
           ...(this.config.voice && { voice: this.config.voice }),
           ...(this.config.model && { model: this.config.model }),
           ...(speed !== 1 && { speed }),
@@ -759,6 +765,8 @@ export class TTSPlayer {
     if (this.samplesSent < TTS_SAMPLE_RATE) return /* 至少 1 秒音频 */
     await this.audioContext.resume()
     this.workletNode.connect(this.audioContext.destination)
+    this.totalPlayed = 0
+    this.lastResumeTime = this.audioContext.currentTime
     this.playStartTime = this.audioContext.currentTime
     this.startedPlaying = true
     this.setState('playing')
@@ -769,22 +777,33 @@ export class TTSPlayer {
     }, 500)
   }
 
+  /** 正确计算已播放秒数 (跨 suspend/resume 不丢失)。 */
+  private getPlayedSecs(): number {
+    if (!this.audioContext || !this.startedPlaying) return 0
+    if (this.audioContext.state === 'running') {
+      return (
+        this.totalPlayed + (this.audioContext.currentTime - this.lastResumeTime)
+      )
+    }
+    return this.totalPlayed
+  }
+
   /** Underrun 检测: buffer 不足 suspend, 恢复后 resume。 */
   private async checkBuffer(): Promise<void> {
     if (!this.audioContext || !this.startedPlaying || this.userPaused) return
-    /* 逐句模式: underrun 阈值用窗口预取量, 不靠 preBufferSecs */
-    const played =
-      this.audioContext.state === 'running'
-        ? this.audioContext.currentTime - this.playStartTime
-        : 0
+    const preBufferTarget = this.config.preBufferSecs ?? 3
+    const played = this.getPlayedSecs()
     const buffered = this.samplesSent / TTS_SAMPLE_RATE - played
-    /* buffer < 0.3s 才 suspend (尽量少打断) */
-    if (this.state === 'playing' && buffered < 0.3) {
+    /* buffer < target*0.3 才 suspend */
+    if (this.state === 'playing' && buffered < preBufferTarget * 0.3) {
+      this.totalPlayed = played
       await this.audioContext.suspend()
       this.setState('buffering')
-    } else if (this.state === 'buffering' && buffered > 1) {
+      this.emitProgress()
+    } else if (this.state === 'buffering' && buffered >= preBufferTarget) {
+      this.totalPlayed = played
       await this.audioContext.resume()
-      this.playStartTime = this.audioContext.currentTime - played
+      this.lastResumeTime = this.audioContext.currentTime
       this.setState('playing')
       this.emitProgress()
     }
@@ -796,10 +815,7 @@ export class TTSPlayer {
     if (now - this.lastProgressTime < PROGRESS_INTERVAL) return
     this.lastProgressTime = now
     const buffered = this.samplesSent / TTS_SAMPLE_RATE
-    const played =
-      this.audioContext.state === 'running' && this.startedPlaying
-        ? Math.max(0, this.audioContext.currentTime - this.playStartTime)
-        : 0
+    const played = this.getPlayedSecs()
     let curIdx = this.currentIndex
     for (let i = this.sentenceOffsets.length - 1; i >= 0; i--) {
       const off = this.sentenceOffsets[i]
@@ -832,6 +848,7 @@ export class TTSPlayer {
   pause(): void {
     if (this.state !== 'playing') return
     this.userPaused = true
+    this.totalPlayed = this.getPlayedSecs()
     this.audioContext?.suspend()
     this.setState('paused')
   }
@@ -839,6 +856,7 @@ export class TTSPlayer {
     if (this.state !== 'paused') return
     this.userPaused = false
     this.audioContext?.resume()
+    this.lastResumeTime = this.audioContext?.currentTime ?? 0
     this.setState('playing')
   }
   togglePause(): void {

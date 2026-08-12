@@ -486,9 +486,18 @@ async function initMarkdownPage(
     title: 'Read aloud',
   })
   ttsBtn.innerHTML = SPEAKER_SVG
+  let selectedSentenceIdx = -1
   ttsBtn.on('click', async () => {
     if (!mdRaw) return
-    await ttsPlayer.play(extractTextForTTS(mdContent.ele))
+    const text = extractTextForTTS(mdContent.ele)
+    await ttsPlayer.play(
+      text,
+      selectedSentenceIdx >= 0 ? selectedSentenceIdx : undefined,
+    )
+    selectedSentenceIdx = -1
+    document
+      .querySelectorAll('.' + SENTENCE_SELECTED_CLS)
+      .forEach(el => el.classList.remove(SENTENCE_SELECTED_CLS))
   })
 
   const ttsPauseBtn = new Ele<HTMLElement>('button', {
@@ -637,6 +646,7 @@ async function initMarkdownPage(
 
   /* ---- sentence DOM wrapping + highlight ---- */
   const SENTENCE_ACTIVE_CLS = className.TTS_SENTENCE + '--active'
+  const SENTENCE_SELECTED_CLS = className.TTS_SENTENCE + '--selected'
   const SENTENCE_SKIP =
     'pre, img, svg, table, .md-reader__head-anchor, .md-reader__btn--copy'
 
@@ -802,16 +812,25 @@ async function initMarkdownPage(
     }
   }
 
-  /* click any sentence span to seek playback */
+  /* click sentence span → select (highlight), not seek. Play button starts from selection. */
   mdContent.ele.addEventListener('click', (ev: MouseEvent) => {
     const tgt = (ev.target as HTMLElement).closest(
       '.' + className.TTS_SENTENCE,
     ) as HTMLElement | null
     if (!tgt) return
     const idx = parseInt(tgt.dataset.idx || '', 10)
-    if (!isNaN(idx)) {
-      ev.preventDefault()
-      ttsPlayer.seekTo(idx)
+    if (isNaN(idx)) return
+    ev.preventDefault()
+    /* toggle selection */
+    if (selectedSentenceIdx === idx) {
+      selectedSentenceIdx = -1
+      tgt.classList.remove(SENTENCE_SELECTED_CLS)
+    } else {
+      selectedSentenceIdx = idx
+      document
+        .querySelectorAll('.' + SENTENCE_SELECTED_CLS)
+        .forEach(el => el.classList.remove(SENTENCE_SELECTED_CLS))
+      tgt.classList.add(SENTENCE_SELECTED_CLS)
     }
   })
 
