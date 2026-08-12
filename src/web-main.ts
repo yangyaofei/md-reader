@@ -487,9 +487,8 @@ async function initMarkdownPage(
   })
   ttsBtn.innerHTML = SPEAKER_SVG
   ttsBtn.on('click', async () => {
-    const text = extractTextForTTS(mdContent.ele)
-    if (!text) return
-    await ttsPlayer.play(text)
+    if (!mdRaw) return
+    await ttsPlayer.play(extractTextForTTS(mdContent.ele))
   })
 
   const ttsPauseBtn = new Ele<HTMLElement>('button', {
@@ -537,13 +536,18 @@ async function initMarkdownPage(
             ttsStopBtn.show()
             break
           }
-          case 'buffering':
+          case 'buffering': {
+            const elb = document.getElementById('md-reader__tts-progress')
+            if (elb && elb.textContent?.indexOf('正在分析') >= 0) {
+              elb.textContent = '⏳ 正在合成语音...'
+            }
             ttsBtn.hide()
             ttsPauseBtn.show()
             ttsPauseBtn.innerHTML = PAUSE_SVG
             ttsPauseBtn.ele.title = 'Buffering...'
             ttsStopBtn.show()
             break
+          }
           case 'playing':
             ttsBtn.hide()
             ttsPauseBtn.show()
@@ -572,7 +576,11 @@ async function initMarkdownPage(
         console.error('TTS error:', msg)
       },
       onSentences: (sentences: Sentence[]) => {
-        wrapSentences(mdContent.ele, sentences)
+        try {
+          wrapSentences(mdContent.ele, sentences)
+        } catch (e) {
+          console.error('[TTS] wrapSentences error:', e)
+        }
       },
       onSentenceChange: (idx: number) => {
         highlightSentence(idx)
@@ -606,6 +614,12 @@ async function initMarkdownPage(
   progressEl.className = 'md-reader__tts-progress'
   progressEl.style.display = 'none'
   document.body.appendChild(progressEl)
+
+  /* ---- Preload: split + normalize on page load ----
+   * 用户打开页面就预取分句 + 归一化, 点击播放时数据已 ready, 首句只需 TTS。 */
+  if (mdRaw) {
+    ttsPlayer.preload(extractTextForTTS(mdContent.ele))
+  }
 
   function formatTime(s: number): string {
     if (s <= 0 || !isFinite(s)) return '0:00'
@@ -731,34 +745,44 @@ async function initMarkdownPage(
           count++
         }
       }
-      return null
+      /* offset is at or past the end of this text node (e.g. after a
+       * previous surroundContents split shortened the node) */
+      return { ni: idx, co: text.length }
     }
 
-    /* right-to-left so wrapping doesn't shift earlier node offsets */
+    /* right-to-left so wrapping doesn't shift earlier node offsets.
+     * Cross-node sentences are wrapped per-text-node (same data-idx)
+     * instead of extractContents which moves DOM nodes and breaks layout. */
     for (let i = sentences.length - 1; i >= 0; i--) {
       const s = locate(bounds[i].start)
       const e = locate(bounds[i].end)
       if (!s || !e) continue
-      const span = document.createElement('span')
-      span.className = className.TTS_SENTENCE
-      span.dataset.idx = String(i)
       try {
-        const range = document.createRange()
-        range.setStart(nodes[s.ni], s.co)
-        range.setEnd(nodes[e.ni], e.co)
-        try {
+        if (s.ni === e.ni) {
+          const span = document.createElement('span')
+          span.className = className.TTS_SENTENCE
+          span.dataset.idx = String(i)
+          const range = document.createRange()
+          range.setStart(nodes[s.ni], s.co)
+          range.setEnd(nodes[e.ni], e.co)
           range.surroundContents(span)
-        } catch (_) {
-          /* surroundContents rejects partially-contained nodes; fall back
-           * to extract+insert which handles cross-node ranges. */
-          const r2 = document.createRange()
-          r2.setStart(nodes[s.ni], s.co)
-          r2.setEnd(nodes[e.ni], e.co)
-          const contents = r2.extractContents()
-          span.appendChild(contents)
-          r2.insertNode(span)
+        } else {
+          for (let ni = e.ni; ni >= s.ni; ni--) {
+            const node = nodes[ni]
+            const text = node.nodeValue || ''
+            const startCo = ni === s.ni ? s.co : 0
+            const endCo = ni === e.ni ? e.co : text.length
+            if (startCo >= endCo) continue
+            const span = document.createElement('span')
+            span.className = className.TTS_SENTENCE
+            span.dataset.idx = String(i)
+            const range = document.createRange()
+            range.setStart(node, startCo)
+            range.setEnd(node, endCo)
+            range.surroundContents(span)
+          }
         }
-      } catch (_) {
+      } catch (e) {
         /* skip this sentence on any failure */
       }
     }
@@ -766,14 +790,15 @@ async function initMarkdownPage(
 
   function highlightSentence(idx: number) {
     const root = mdContent.ele
-    const prev = root.querySelector('.' + SENTENCE_ACTIVE_CLS)
-    if (prev) prev.classList.remove(SENTENCE_ACTIVE_CLS)
-    const target = root.querySelector(
+    root
+      .querySelectorAll('.' + SENTENCE_ACTIVE_CLS)
+      .forEach(el => el.classList.remove(SENTENCE_ACTIVE_CLS))
+    const targets = root.querySelectorAll(
       `.${className.TTS_SENTENCE}[data-idx="${idx}"]`,
     )
-    if (target) {
-      target.classList.add(SENTENCE_ACTIVE_CLS)
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (targets.length) {
+      targets.forEach(t => t.classList.add(SENTENCE_ACTIVE_CLS))
+      targets[0].scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
   }
 

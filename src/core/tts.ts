@@ -29,7 +29,7 @@ export interface TTSConfig {
   preBufferSecs: number
   /** TTS PCM 缓存窗口 (默认 5): 当前句 + 后 N 句保持已合成 PCM。 */
   audioWindowSize: number
-  /** normalize 领前窗口 (默认 15, >= 2*audioWindowSize): 预取归一化文本, 保证 TTS 不等 normalize。 */
+  /** normalize 领前窗口 (默认 5, >= 2*audioWindowSize): 预取归一化文本, 保证 TTS 不等 normalize。 */
   normalizeWindowSize: number
   /** (已弃用) 旧名单窗口, 读取时 fallback 到 audioWindowSize。 */
   windowSize?: number
@@ -342,8 +342,8 @@ export class TTSPlayer {
   private sentences: Sentence[] = []
   private currentIndex = 0
   private lastReportedIndex = -1
-  private audioWindowSize = 5
-  private normalizeWindowSize = 15
+  private audioWindowSize = 3
+  private normalizeWindowSize = 5
   private normalizing = new Set<number>()
   private normalizeControllers = new Map<number, AbortController>()
 
@@ -352,8 +352,10 @@ export class TTSPlayer {
   private sentenceOffsets: number[] = []
   /** [idx] = 归一化后的 tts_text (第二步产物)。 */
   private normalizeCache = new Map<number, string>()
-  /** [idx] = 完整 PCM (第三步产物)。 */
-  private audioCache = new Map<number, Float32Array>()
+  /** [idx] = PCM chunks (流式: 边下载边入队, feed loop 边出队播)。 */
+  private audioQueues = new Map<number, Float32Array[]>()
+  /** 标记句子 i 的 TTS 流已结束 (所有 chunk 已入队)。 */
+  private audioDone = new Set<number>()
   private fetching = new Set<number>()
   private sentenceControllers = new Map<number, AbortController>()
   private masterAbort: AbortController | null = null
@@ -361,6 +363,9 @@ export class TTSPlayer {
   private startedPlaying = false
   private userPaused = false
   private lastProgressTime = 0
+  private bufferTimer: ReturnType<typeof setInterval> | null = null
+  /** preload 的 splitText promise, play() 可复用。 */
+  private preloadPromise: Promise<Sentence[]> | null = null
 
   constructor(
     callbacks: TTSPlayerCallbacks = {},
@@ -368,8 +373,8 @@ export class TTSPlayer {
   ) {
     this.callbacks = callbacks
     this.config = config
-    this.audioWindowSize = config.audioWindowSize ?? config.windowSize ?? 5
-    this.normalizeWindowSize = config.normalizeWindowSize ?? 15
+    this.audioWindowSize = config.audioWindowSize ?? config.windowSize ?? 3
+    this.normalizeWindowSize = config.normalizeWindowSize ?? 5
   }
 
   updateConfig(config: Partial<TTSConfig>): void {
@@ -394,26 +399,62 @@ export class TTSPlayer {
     this.callbacks.onStateChange?.(s)
   }
 
-  /** 播放整篇: split → setup → playFrom(0)。 */
+  /**
+   * 预加载: split + normalize 预取 (不做 TTS PCM —— 省带宽)。
+   * 页面渲染后立即调用, 用户点击播放时 normalize 已 ready, 首句只需 TTS。
+   */
+  preload(text: string): void {
+    if (!text.trim()) return
+    this.currentText = text
+    this.preloadPromise = splitText(text, this.config)
+      .then(sentences => {
+        this.sentences = sentences
+        /* 后台预取 normalize (前 N 句) */
+        if (!this.masterAbort) this.masterAbort = new AbortController()
+        this.ensureNormalize(0)
+        return sentences
+      })
+      .catch(e => {
+        console.warn('[TTS] preload split failed:', e)
+        return []
+      })
+  }
+
+  /** 播放整篇: setup → split (或复用 preload) → playFrom(0)。 */
   async play(text: string): Promise<void> {
     if (!text.trim()) return
+    const sameText = this.currentText === text
+
+    /* 停止当前音频 (保留 preload 的 sentences + normalizeCache) */
     this.stopInternal()
     this.currentText = text
     this.setState('loading')
-    try {
-      this.sentences = await splitText(text, this.config)
-    } catch (e: any) {
-      this.callbacks.onError?.('split: ' + (e.message || String(e)))
-      this.setState('idle')
-      return
+    await this.setupAudio()
+    if (!this.audioContext || !this.workletNode) return
+
+    /* 复用 preload 结果, 或重新 split */
+    if (sameText && this.preloadPromise) {
+      try {
+        await this.preloadPromise
+      } catch (_) {
+        /* noop */
+      }
+      this.preloadPromise = null
+    } else if (!sameText || this.sentences.length === 0) {
+      this.preloadPromise = null
+      try {
+        this.sentences = await splitText(text, this.config)
+      } catch (e: any) {
+        this.callbacks.onError?.('split: ' + (e.message || String(e)))
+        this.setState('idle')
+        return
+      }
     }
     if (!this.sentences.length) {
       this.setState('idle')
       return
     }
     this.callbacks.onSentences?.(this.sentences)
-    await this.setupAudio()
-    if (!this.audioContext || !this.workletNode) return
     await this.playFrom(0)
   }
 
@@ -427,22 +468,32 @@ export class TTSPlayer {
 
   private async setupAudio(): Promise<void> {
     this.audioContext = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
-    if (this.audioContext.state === 'running') await this.audioContext.suspend()
+    /* Chrome autoplay 策略: AudioContext 必须在用户手势内 resume 过一次。
+     * 这里在 setupAudio (play/seek 的同步栈) 内 resume+suspend 解锁，
+     * 后续 maybeStart 的 resume 即使在 normalize 长等待后也能生效。 */
+    try {
+      await this.audioContext.resume()
+    } catch (_) {
+      /* noop */
+    }
+    await this.audioContext.suspend()
     this.playStartTime = 0
     this.samplesSent = 0
     this.lastProgressTime = 0
     this.userPaused = false
     this.startedPlaying = false
     this.sentenceOffsets = []
-    this.audioCache.clear()
-    this.normalizeCache.clear()
+    this.audioQueues.clear()
+    this.audioDone.clear()
     this.lastReportedIndex = -1
     await this.audioContext.audioWorklet.addModule(getWorkletUrl())
     this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-player')
     this.workletNode.port.onmessage = (e: MessageEvent) => {
       if (e.data === 'ended') {
         this.setState('idle')
-        this.cleanup()
+        this.cleanupAudio()
+        this.sentences = []
+        this.normalizeCache.clear()
       }
     }
     this.masterAbort = new AbortController()
@@ -457,11 +508,14 @@ export class TTSPlayer {
     this.currentIndex = index
     this.lastReportedIndex = -1
     this.sentenceOffsets = []
+    this.audioQueues.clear()
+    this.audioDone.clear()
     this.workletNode.port.postMessage('flush')
     this.samplesSent = 0
     this.startedPlaying = false
     if (this.audioContext.state === 'running') await this.audioContext.suspend()
-    if (this.state !== 'paused') this.setState('loading')
+    if (this.state !== 'paused' && this.state !== 'playing')
+      this.setState('buffering')
 
     this.ensureNormalize(index)
     this.ensureAudio(index)
@@ -469,41 +523,49 @@ export class TTSPlayer {
     let next = index
     while (next < this.sentences.length) {
       if (this.epoch !== myEpoch) return
-      const pcm = await this.waitForAudio(next, myEpoch)
-      if (this.epoch !== myEpoch) return
-      if (!this.workletNode || !this.audioContext) return
-      this.sentenceOffsets[next] = this.samplesSent
-      if (pcm.length > 0) {
-        /* Read pcm.length BEFORE postMessage transfers the buffer —
-         * a transferred ArrayBuffer detaches the view, after which
-         * TypedArray.length returns 0 (byteLength becomes 0). */
-        this.samplesSent += pcm.length
-        try {
-          this.workletNode.port.postMessage(pcm, [pcm.buffer])
-        } catch (_) {
-          /* noop — buffer transfer failure shouldn't crash playback */
+
+      /* 1. 当前句有 chunk 可消费 → 立即喂 worklet */
+      const q = this.audioQueues.get(next)
+      if (q && q.length > 0) {
+        const pcm = q.shift()!
+        this.sentenceOffsets[next] =
+          this.sentenceOffsets[next] ?? this.samplesSent
+        if (pcm.length > 0) {
+          this.samplesSent += pcm.length
+          try {
+            this.workletNode?.port.postMessage(pcm, [pcm.buffer])
+          } catch (_) {
+            /* noop */
+          }
         }
+        await this.maybeStart()
+        this.emitProgress()
+        continue /* 立即尝试下一个 chunk, 不 sleep */
       }
-      await this.maybeStart()
-      this.emitProgress()
-      next++
-      this.ensureNormalize(next)
-      this.ensureAudio(next)
+
+      /* 2. 当前句 TTS 流已结束 → 前进到下一句 */
+      if (this.audioDone.has(next)) {
+        this.audioQueues.delete(next)
+        this.audioDone.delete(next)
+        next++
+        this.ensureNormalize(next)
+        this.ensureAudio(next)
+        continue
+      }
+
+      /* 3. 还在等 TTS chunk → sleep 避免忙等 */
+      await sleep(50)
     }
+
     if (this.epoch !== myEpoch) return
+    /* 所有句子已喂完 — 通知 worklet 流结束。 */
     this.workletNode?.port.postMessage(null)
     /* 等尾音播完 (worklet fires 'ended')。 */
     while (
       (this.state === 'playing' || this.state === 'buffering') &&
       this.epoch === myEpoch
     ) {
-      if (
-        this.state === 'buffering' &&
-        this.audioContext &&
-        this.startedPlaying
-      ) {
-        await this.audioContext.resume()
-      }
+      await this.checkBuffer()
       await sleep(300)
       this.emitProgress()
     }
@@ -528,13 +590,17 @@ export class TTSPlayer {
       fromIndex + this.audioWindowSize,
     )
     for (let i = fromIndex; i < end; i++) {
-      if (!this.audioCache.has(i) && !this.fetching.has(i)) {
+      if (
+        !this.audioDone.has(i) &&
+        !this.fetching.has(i) &&
+        !this.audioQueues.has(i)
+      ) {
         this.fetchAudio(i)
       }
     }
   }
 
-  /** 单句完整流水线: normalize → fetch PCM → audioCache。 */
+  /** 单句流水线: normalize → 流式 TTS → chunk 入队 audioQueues[i]。 */
   private fetchNormalize(i: number): void {
     this.normalizing.add(i)
     const ctrl = new AbortController()
@@ -574,6 +640,7 @@ export class TTSPlayer {
     return this.normalizeCache.get(i) || this.sentences[i]?.original || ''
   }
 
+  /** 单句流水线: normalize → 流式 TTS → chunk 入队 audioQueues[i]。 */
   private fetchAudio(i: number): void {
     this.fetching.add(i)
     const ctrl = new AbortController()
@@ -585,35 +652,16 @@ export class TTSPlayer {
       try {
         const ttsText = await this.waitForNormalize(i, this.epoch)
         if (ctrl.signal.aborted) return
-        const pcm = await this.fetchSentencePCM(ttsText, ctrl.signal)
-        if (!ctrl.signal.aborted) this.audioCache.set(i, pcm)
+        await this.streamSentencePCM(i, ttsText, ctrl.signal)
       } catch (e: any) {
         if (e?.name === 'AbortError') return
         this.callbacks.onError?.(`sentence ${i}: ${e?.message || String(e)}`)
-        this.audioCache.set(i, new Float32Array(0))
       } finally {
+        if (!ctrl.signal.aborted) this.audioDone.add(i)
         this.fetching.delete(i)
         this.sentenceControllers.delete(i)
       }
     })()
-  }
-
-  /** 阻塞直到句子 i 的 PCM 就绪 (或 epoch 变)。 */
-  private async waitForAudio(
-    i: number,
-    myEpoch: number,
-  ): Promise<Float32Array> {
-    while (this.epoch === myEpoch && !this.audioCache.has(i)) {
-      if (
-        this.epoch === myEpoch &&
-        !this.fetching.has(i) &&
-        !this.audioCache.has(i)
-      ) {
-        this.fetchAudio(i)
-      }
-      await sleep(50)
-    }
-    return this.audioCache.get(i) || new Float32Array(0)
   }
 
   private abortFetches(): void {
@@ -625,12 +673,13 @@ export class TTSPlayer {
     this.fetching.clear()
   }
 
-  /** 第三步: 调 audio/speech 拿单句 PCM (纯 TTS, 无前处理)。 */
-  private async fetchSentencePCM(
+  /** 第三步: 调 audio/speech, 流式读取 PCM chunk 入队 (不等整句下载完)。 */
+  private async streamSentencePCM(
+    index: number,
     text: string,
     signal: AbortSignal,
-  ): Promise<Float32Array> {
-    if (!text.trim()) return new Float32Array(0)
+  ): Promise<void> {
+    if (!text.trim()) return
     const useDirect = !!(this.config.apiUrl && this.config.apiKey)
     const url = useDirect ? this.config.apiUrl! : '/api/tts'
     const headers: Record<string, string> = {
@@ -660,8 +709,6 @@ export class TTSPlayer {
     }
     if (!resp.body) throw new Error('No response body')
     const reader = resp.body.getReader()
-    const chunks: Uint8Array[] = []
-    let total = 0
     let headerStripped = false
     let leftover: Uint8Array | null = null
     while (true) {
@@ -685,33 +732,59 @@ export class TTSPlayer {
         chunk = chunk.slice(0, chunk.length - 1)
       }
       if (chunk.length < 2) continue
-      chunks.push(chunk)
-      total += chunk.length
+      const pcm = pcmToInt16Float(chunk)
+      if (pcm.length > 0) {
+        if (!this.audioQueues.has(index)) this.audioQueues.set(index, [])
+        this.audioQueues.get(index)!.push(pcm)
+      }
     }
     if (leftover && leftover.length >= 2) {
       const even = leftover.length & ~1
-      chunks.push(leftover.slice(0, even))
-      total += even
+      const pcm = pcmToInt16Float(leftover.slice(0, even))
+      if (pcm.length > 0) {
+        if (!this.audioQueues.has(index)) this.audioQueues.set(index, [])
+        this.audioQueues.get(index)!.push(pcm)
+      }
     }
-    const merged = new Uint8Array(total)
-    let off = 0
-    for (const c of chunks) {
-      merged.set(c, off)
-      off += c.length
-    }
-    return pcmToInt16Float(merged)
   }
 
-  /** 有 PCM 即播放 (不再等 30s preBuffer —— 逐句模式靠窗口预取避免 underrun)。 */
+  /** 有 PCM 即播放 (逐句模式靠窗口预取避免 underrun)。 */
   private async maybeStart(): Promise<void> {
     if (this.startedPlaying || !this.workletNode || !this.audioContext) return
-    if (this.samplesSent === 0) return
+    /* 首句 PCM 到就开播 —— 逐句模式下靠 ensureAudio 预取窗口避免 underrun,
+     * 不需要等 preBuffer 积累 (那是整篇模式的设计)。 */
+    if (this.samplesSent < TTS_SAMPLE_RATE) return /* 至少 1 秒音频 */
     await this.audioContext.resume()
     this.workletNode.connect(this.audioContext.destination)
     this.playStartTime = this.audioContext.currentTime
     this.startedPlaying = true
     this.setState('playing')
     this.emitProgress()
+    if (this.bufferTimer) clearInterval(this.bufferTimer)
+    this.bufferTimer = setInterval(() => {
+      this.checkBuffer()
+    }, 500)
+  }
+
+  /** Underrun 检测: buffer 不足 suspend, 恢复后 resume。 */
+  private async checkBuffer(): Promise<void> {
+    if (!this.audioContext || !this.startedPlaying || this.userPaused) return
+    /* 逐句模式: underrun 阈值用窗口预取量, 不靠 preBufferSecs */
+    const played =
+      this.audioContext.state === 'running'
+        ? this.audioContext.currentTime - this.playStartTime
+        : 0
+    const buffered = this.samplesSent / TTS_SAMPLE_RATE - played
+    /* buffer < 0.3s 才 suspend (尽量少打断) */
+    if (this.state === 'playing' && buffered < 0.3) {
+      await this.audioContext.suspend()
+      this.setState('buffering')
+    } else if (this.state === 'buffering' && buffered > 1) {
+      await this.audioContext.resume()
+      this.playStartTime = this.audioContext.currentTime - played
+      this.setState('playing')
+      this.emitProgress()
+    }
   }
 
   private emitProgress(): void {
@@ -741,7 +814,7 @@ export class TTSPlayer {
       playedSecs: played,
       bufferedSecs: Math.max(0, buffered - played),
       totalEstimate: this.currentText.length / 4,
-      preBufferTarget: this.config.preBufferSecs ?? 0,
+      preBufferTarget: this.config.preBufferSecs ?? 3,
       phase:
         this.state === 'loading' || this.state === 'buffering'
           ? 'buffering'
@@ -771,6 +844,9 @@ export class TTSPlayer {
   }
   stop(): void {
     this.stopInternal()
+    this.sentences = []
+    this.normalizeCache.clear()
+    this.preloadPromise = null
     this.setState('idle')
   }
   private stopInternal(): void {
@@ -780,9 +856,13 @@ export class TTSPlayer {
       this.masterAbort.abort()
       this.masterAbort = null
     }
-    this.cleanup()
+    this.cleanupAudio()
   }
-  private cleanup(): void {
+  private cleanupAudio(): void {
+    if (this.bufferTimer) {
+      clearInterval(this.bufferTimer)
+      this.bufferTimer = null
+    }
     if (this.workletNode) {
       try {
         this.workletNode.disconnect()
@@ -795,9 +875,8 @@ export class TTSPlayer {
       this.audioContext.close().catch(() => {})
       this.audioContext = null
     }
-    this.sentences = []
-    this.audioCache.clear()
-    this.normalizeCache.clear()
+    this.audioQueues.clear()
+    this.audioDone.clear()
     this.startedPlaying = false
   }
 }
