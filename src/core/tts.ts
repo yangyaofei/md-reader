@@ -686,9 +686,7 @@ export class TTSPlayer {
     text: string,
     signal: AbortSignal,
   ): Promise<void> {
-    /* 去除 normalize 加的拼音标注 (TTS 引擎会当文本读) */
-    const cleanText = text.replace(/\([a-zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ ]+\)/gi, '')
-    if (!cleanText.trim()) return
+    if (!text.trim()) return
     const useDirect = !!(this.config.apiUrl && this.config.apiKey)
     const url = useDirect ? this.config.apiUrl! : '/api/tts'
     const headers: Record<string, string> = {
@@ -699,12 +697,12 @@ export class TTSPlayer {
     const body = useDirect
       ? JSON.stringify({
           model: this.config.model || 'qwen',
-          input: cleanText,
+          input: text,
           voice: this.config.voice || 'alloy',
           ...(speed !== 1 && { speed }),
         })
       : JSON.stringify({
-          text: cleanText,
+          text,
           ...(this.config.voice && { voice: this.config.voice }),
           ...(this.config.model && { model: this.config.model }),
           ...(speed !== 1 && { speed }),
