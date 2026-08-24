@@ -9,15 +9,34 @@
  * 滑动窗口: [currentIndex, currentIndex+N) 并发跑 (normalize → PCM) 整句流水线,
  * N 句同时在不同阶段, 抵消 LLM 归一化延迟。seekTo(index) 从任意句重启窗口。
  *
- * 关键修复: maybeStart 不再等 30s preBuffer (逐句模式单句几秒永远达不到),
- * 有 PCM 即播放; underrun 靠窗口预取避免, 不 suspend audioContext。
+ * 统一水位线 (单一机制): ensurePlaybackState() 一个状态机管开播/恢复/suspend,
+ * high = preBufferSecs (开播+恢复门槛), low = 0.3*high (suspend 门槛)。
+ *
+ * 批次流水线 (GPU 两阶段时序): normalize 领前 audio 一个批次 —
+ * audio 窗口 = [head, head+N), normalize 窗口 = [head, head+2N),
+ * 同一句两阶段严格不叠加, TTS 永远追不上 normalize。
  */
 const TTS_SAMPLE_RATE = 24000
 const WAV_HEADER_SIZE = 44
 const CONFIG_KEY = 'md-reader__tts-config'
 const PROGRESS_INTERVAL = 1000 // ms
 
+/* ---------- 缓冲池模型 (用户指定: 线性 TTS + 并发 normalize) ---------- */
+/** normalize 并发数: 同时最多多少个单句 /normalize 请求 (每句一个 prompt)。 */
+const NORMALIZE_CONCURRENCY = 5
+/** normalize 领前池上限 (句): 已归一化领先已合成句数 >= 8 → 暂停归一化。
+ *  恢复由消费推进触发 (每句合成后 ensureNormalize 会重新评估)。 */
+const NORM_LEAD_HIGH = 8
+/** 音频池上限 (秒): buffered >= 30 → 停止 TTS 合成。 */
+const BUFFER_HIGH = 30
+/** 音频池下限 (秒): buffered < 10 → 恢复 TTS 合成。 */
+const BUFFER_LOW = 10
+
 export type TTSState = 'idle' | 'loading' | 'playing' | 'paused' | 'buffering'
+
+/** 统一水位线默认秒数 — UI 与 player 共用此常量 (单一数据源),
+ *  禁止在两处各自硬编码默认值。 */
+export const DEFAULT_PRE_BUFFER_SECS = 15
 
 export interface TTSConfig {
   apiUrl: string
@@ -25,13 +44,11 @@ export interface TTSConfig {
   model: string
   voice: string
   speed: number
-  /** (已弃用, 逐句模式靠窗口预取) 保留兼容。 */
+  /** 统一水位线 (秒): 攒够 preBufferSecs 才开播/恢复, 掉到 30% 才 suspend。 */
   preBufferSecs: number
-  /** TTS PCM 缓存窗口 (默认 5): 当前句 + 后 N 句保持已合成 PCM。 */
-  audioWindowSize: number
-  /** normalize 领前窗口 (默认 5, >= 2*audioWindowSize): 预取归一化文本, 保证 TTS 不等 normalize。 */
-  normalizeWindowSize: number
-  /** (已弃用) 旧名单窗口, 读取时 fallback 到 audioWindowSize。 */
+  /** (已弃用) 旧窗口配置, 保留兼容: 线性 TTS + 并发 normalize 由池水位驱动。 */
+  audioWindowSize?: number
+  /** (已弃用) 旧名单窗口, 读取时 fallback。 */
   windowSize?: number
 }
 
@@ -58,6 +75,10 @@ export interface PlaybackProgress {
   phase: 'buffering' | 'playing' | 'paused'
   sentenceIndex: number
   sentenceTotal: number
+  /** 已归一化句数 (normalize 流水线进度)。 */
+  normalizedCount: number
+  /** 已合成句数 (TTS 流水线进度)。 */
+  synthesizedCount: number
 }
 
 export interface TTSPlayerCallbacks {
@@ -342,10 +363,15 @@ export class TTSPlayer {
   private sentences: Sentence[] = []
   private currentIndex = 0
   private lastReportedIndex = -1
-  private audioWindowSize = 3
-  private normalizeWindowSize = 5
   private normalizing = new Set<number>()
   private normalizeControllers = new Map<number, AbortController>()
+
+  /** 线性 TTS 指针: 下一个要合成的句子 (一句完成 → 下一句, 不并行)。 */
+  private nextTtsIndex = 0
+  /** 线性 normalize 指针: 下一个要启动归一化的句子。 */
+  private nextNormalizeIndex = 0
+  /** 在飞的单句 normalize 请求数 (上限 NORMALIZE_CONCURRENCY)。 */
+  private activeNormalize = 0
 
   private samplesSent = 0
   private playStartTime = 0
@@ -368,6 +394,10 @@ export class TTSPlayer {
   private userPaused = false
   private lastProgressTime = 0
   private bufferTimer: ReturnType<typeof setInterval> | null = null
+  /** 所有句子 PCM 已全部喂入 rbuf (流结束) — 尾部不再 suspend。 */
+  private allFed = false
+  /** worklet 是否已连接到 destination (pause 会断连, resume 重连)。 */
+  private workletConnected = false
   /** preload 的 splitText promise, play() 可复用。 */
   private preloadPromise: Promise<Sentence[]> | null = null
 
@@ -377,17 +407,10 @@ export class TTSPlayer {
   ) {
     this.callbacks = callbacks
     this.config = config
-    this.audioWindowSize = config.audioWindowSize ?? config.windowSize ?? 3
-    this.normalizeWindowSize = config.normalizeWindowSize ?? 5
   }
 
   updateConfig(config: Partial<TTSConfig>): void {
     this.config = { ...this.config, ...config }
-    if (config.audioWindowSize != null)
-      this.audioWindowSize = config.audioWindowSize
-    else if (config.windowSize != null) this.audioWindowSize = config.windowSize
-    if (config.normalizeWindowSize != null)
-      this.normalizeWindowSize = config.normalizeWindowSize
   }
 
   getState(): TTSState {
@@ -415,7 +438,7 @@ export class TTSPlayer {
         this.sentences = sentences
         /* 后台预取 normalize (前 N 句) */
         if (!this.masterAbort) this.masterAbort = new AbortController()
-        this.ensureNormalize(0)
+        this.ensureNormalize()
         /* 立即包裹 DOM — 用户进页面就能看到句子结构 + 点击 seek */
         this.callbacks.onSentences?.(sentences)
         return sentences
@@ -477,7 +500,7 @@ export class TTSPlayer {
     this.audioContext = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
     /* Chrome autoplay 策略: AudioContext 必须在用户手势内 resume 过一次。
      * 这里在 setupAudio (play/seek 的同步栈) 内 resume+suspend 解锁，
-     * 后续 maybeStart 的 resume 即使在 normalize 长等待后也能生效。 */
+     * 后续 ensurePlaybackState 的 resume 即使在 normalize 长等待后也能生效。 */
     try {
       await this.audioContext.resume()
     } catch (_) {
@@ -520,16 +543,33 @@ export class TTSPlayer {
     this.workletNode.port.postMessage('flush')
     this.samplesSent = 0
     this.startedPlaying = false
+    this.allFed = false
+    if (this.bufferTimer) clearInterval(this.bufferTimer)
+    this.bufferTimer = setInterval(() => {
+      this.ensurePlaybackState()
+    }, 500)
     if (this.audioContext.state === 'running') await this.audioContext.suspend()
     if (this.state !== 'paused' && this.state !== 'playing')
       this.setState('buffering')
 
-    this.ensureNormalize(index)
-    this.ensureAudio(index)
+    this.nextTtsIndex = index
+    this.nextNormalizeIndex = index
+    this.activeNormalize = 0
+    this.ensureNormalize()
+    /* 线性 TTS 合成循环 (后台): 一句一句顺序合成, 音频池 [10s, 30s] 滞回。 */
+    const ttsPromise = this.ttsLoop(myEpoch)
 
     let next = index
     while (next < this.sentences.length) {
       if (this.epoch !== myEpoch) return
+
+      /* 用户暂停: 停止喂 worklet (rbuf 只有 60s 容量, 持续喂会环形溢出覆盖未播数据),
+       * 数据留在 audioQueues, resume 后继续喂。 */
+      if (this.userPaused) {
+        await sleep(200)
+        this.emitProgress()
+        continue
+      }
 
       /* 1. 当前句有 chunk 可消费 → 立即喂 worklet */
       const q = this.audioQueues.get(next)
@@ -545,7 +585,7 @@ export class TTSPlayer {
             /* noop */
           }
         }
-        await this.maybeStart()
+        await this.ensurePlaybackState()
         this.emitProgress()
         continue /* 立即尝试下一个 chunk, 不 sleep */
       }
@@ -555,60 +595,62 @@ export class TTSPlayer {
         this.audioQueues.delete(next)
         this.audioDone.delete(next)
         next++
-        this.ensureNormalize(next)
-        this.ensureAudio(next)
+        this.ensureNormalize()
         continue
       }
 
-      /* 3. 还在等 TTS chunk → sleep 避免忙等 */
+      /* 3. 还在等 TTS chunk → sleep 避免忙等, 同时更新进度条 */
       await sleep(50)
+      this.emitProgress()
     }
 
     if (this.epoch !== myEpoch) return
-    /* 所有句子已喂完 — 通知 worklet 流结束。 */
+    await ttsPromise
+    /* 所有句子已喂完 — 通知 worklet 流结束, 剩余音频播完为止 (不再 suspend)。 */
+    this.allFed = true
     this.workletNode?.port.postMessage(null)
     /* 等尾音播完 (worklet fires 'ended')。 */
     while (
       (this.state === 'playing' || this.state === 'buffering') &&
       this.epoch === myEpoch
     ) {
-      await this.checkBuffer()
+      await this.ensurePlaybackState()
       await sleep(300)
       this.emitProgress()
     }
   }
 
-  /** 预取窗口 [from, from+windowSize): 并发跑 normalize→PCM 整句流水线。 */
-  private ensureNormalize(fromIndex: number): void {
-    const end = Math.min(
-      this.sentences.length,
-      fromIndex + this.normalizeWindowSize,
-    )
-    for (let i = fromIndex; i < end; i++) {
-      if (!this.normalizeCache.has(i) && !this.normalizing.has(i)) {
-        this.fetchNormalize(i)
-      }
-    }
-  }
-
-  private ensureAudio(fromIndex: number): void {
-    const end = Math.min(
-      this.sentences.length,
-      fromIndex + this.audioWindowSize,
-    )
-    for (let i = fromIndex; i < end; i++) {
-      if (
-        !this.audioDone.has(i) &&
-        !this.fetching.has(i) &&
-        !this.audioQueues.has(i)
+  /** normalize 并发调度: 从 nextNormalizeIndex 线性推进, 最多 NORMALIZE_CONCURRENCY
+   *  个单句请求同时飞 (每句一个 prompt)。领前池 [NORM_LEAD_LOW, NORM_LEAD_HIGH]
+   *  滞回: 已归一化领先已合成 >= HIGH → 暂停; < LOW → 恢复。
+   *  每句完成 (fetchNormalizeOne 的 finally) 会回调本方法填坑。 */
+  private ensureNormalize(): void {
+    if (!this.sentences.length) return
+    while (
+      this.activeNormalize < NORMALIZE_CONCURRENCY &&
+      this.nextNormalizeIndex < this.sentences.length
+    ) {
+      /* 跳过已缓存的句子 (preload / seek 前已归一化) */
+      while (
+        this.nextNormalizeIndex < this.sentences.length &&
+        (this.normalizeCache.has(this.nextNormalizeIndex) ||
+          this.normalizing.has(this.nextNormalizeIndex))
       ) {
-        this.fetchAudio(i)
+        this.nextNormalizeIndex++
       }
+      if (this.nextNormalizeIndex >= this.sentences.length) break
+      /* 领前池上限: 归一化指针领先 TTS 指针 >= HIGH → 停下 */
+      if (this.nextNormalizeIndex - this.nextTtsIndex >= NORM_LEAD_HIGH) {
+        break
+      }
+      const i = this.nextNormalizeIndex++
+      this.activeNormalize++
+      this.fetchNormalizeOne(i)
     }
   }
 
-  /** 单句流水线: normalize → 流式 TTS → chunk 入队 audioQueues[i]。 */
-  private fetchNormalize(i: number): void {
+  /** 单句 normalize: 一次 HTTP 请求一个 prompt, 结果入 cache。 */
+  private fetchNormalizeOne(i: number): void {
     this.normalizing.add(i)
     const ctrl = new AbortController()
     this.normalizeControllers.set(i, ctrl)
@@ -624,13 +666,66 @@ export class TTSPlayer {
         if (!ctrl.signal.aborted) this.normalizeCache.set(i, ttsText)
       } catch (e: any) {
         if (e?.name === 'AbortError') return
-        this.callbacks.onError?.(`normalize ${i}: ${e?.message || String(e)}`)
+        console.warn(`[TTS] normalize ${i} failed:`, e)
         this.normalizeCache.set(i, this.sentences[i].original)
       } finally {
-        this.normalizing.delete(i)
-        this.normalizeControllers.delete(i)
+        /* aborted 的请求不填坑不计数 — 指针已由 playFrom/abortFetches 重置 */
+        if (!ctrl.signal.aborted) {
+          this.activeNormalize--
+          this.normalizing.delete(i)
+          this.normalizeControllers.delete(i)
+          this.ensureNormalize()
+        }
       }
     })()
+  }
+
+  /** 线性 TTS 合成循环 (后台): 一句一句顺序合成, 不并行。
+   *  音频池滞回: buffered >= BUFFER_HIGH → 暂停合成; < BUFFER_LOW → 恢复。
+   *  normalize 由 ensureNormalize 并发预取, 此处只等结果。 */
+  private async ttsLoop(myEpoch: number): Promise<void> {
+    while (
+      this.epoch === myEpoch &&
+      this.nextTtsIndex < this.sentences.length
+    ) {
+      /* 暂停期间不合成 — 防恢复后积压句灌爆环形 rbuf (覆盖未播数据) */
+      if (this.userPaused) {
+        await sleep(300)
+        continue
+      }
+      const buffered = this.samplesSent / TTS_SAMPLE_RATE - this.getPlayedSecs()
+      if (buffered >= BUFFER_HIGH) {
+        await sleep(300)
+        continue
+      }
+      const i = this.nextTtsIndex
+      if (this.fetching.has(i) || this.audioDone.has(i)) {
+        this.nextTtsIndex++
+        continue
+      }
+      this.fetching.add(i)
+      try {
+        const ttsText = await this.waitForNormalize(i, myEpoch)
+        if (this.epoch !== myEpoch) return
+        await this.streamSentencePCM(
+          i,
+          ttsText,
+          this.masterAbort
+            ? this.masterAbort.signal
+            : new AbortController().signal,
+        )
+        if (this.epoch !== myEpoch) return
+        this.audioDone.add(i)
+      } catch (e: any) {
+        if (e?.name === 'AbortError') return
+        this.callbacks.onError?.(`sentence ${i}: ${e?.message || String(e)}`)
+        /* 失败也标记完成 (空音频), feed loop 前进不卡死 */
+        this.audioDone.add(i)
+      } finally {
+        this.fetching.delete(i)
+      }
+      this.nextTtsIndex++
+    }
   }
 
   private async waitForNormalize(i: number, myEpoch: number): Promise<string> {
@@ -640,35 +735,11 @@ export class TTSPlayer {
         !this.normalizing.has(i) &&
         !this.normalizeCache.has(i)
       ) {
-        this.fetchNormalize(i)
+        this.ensureNormalize()
       }
       await sleep(50)
     }
     return this.normalizeCache.get(i) || this.sentences[i]?.original || ''
-  }
-
-  /** 单句流水线: normalize → 流式 TTS → chunk 入队 audioQueues[i]。 */
-  private fetchAudio(i: number): void {
-    this.fetching.add(i)
-    const ctrl = new AbortController()
-    this.sentenceControllers.set(i, ctrl)
-    if (this.masterAbort) {
-      this.masterAbort.signal.addEventListener('abort', () => ctrl.abort())
-    }
-    ;(async () => {
-      try {
-        const ttsText = await this.waitForNormalize(i, this.epoch)
-        if (ctrl.signal.aborted) return
-        await this.streamSentencePCM(i, ttsText, ctrl.signal)
-      } catch (e: any) {
-        if (e?.name === 'AbortError') return
-        this.callbacks.onError?.(`sentence ${i}: ${e?.message || String(e)}`)
-      } finally {
-        if (!ctrl.signal.aborted) this.audioDone.add(i)
-        this.fetching.delete(i)
-        this.sentenceControllers.delete(i)
-      }
-    })()
   }
 
   private abortFetches(): void {
@@ -755,56 +826,100 @@ export class TTSPlayer {
     }
   }
 
-  /** 有 PCM 即播放 (逐句模式靠窗口预取避免 underrun)。 */
-  private async maybeStart(): Promise<void> {
-    if (this.startedPlaying || !this.workletNode || !this.audioContext) return
-    /* 首句 PCM 到就开播 —— 逐句模式下靠 ensureAudio 预取窗口避免 underrun,
-     * 不需要等 preBuffer 积累 (那是整篇模式的设计)。 */
-    if (this.samplesSent < TTS_SAMPLE_RATE) return /* 至少 1 秒音频 */
-    await this.audioContext.resume()
+  /** 统一水位线状态机 — 单一机制管理开播/resume/suspend。
+   *  两条水位线: high = preBufferSecs (开播+恢复门槛), low = high*0.3 (suspend 门槛)。
+   *  状态环: buffering --(buffered>=high)--> playing --(buffered<low)--> buffering。
+   *  首次开播就是 buffering→playing 的同一次判断, 不存在第二套逻辑。 */
+  private async ensurePlaybackState(): Promise<void> {
+    if (!this.audioContext || !this.workletNode) return
+    /* 暂停: 强制保持 suspended — 浏览器长时间挂起后可能自动恢复 AudioContext,
+     * 必须拉回, 否则 worklet 继续消费 rbuf, 恢复后内容跳跃与高亮对不上。 */
+    if (this.userPaused) {
+      if (this.audioContext.state === 'running') {
+        void this.audioContext.suspend()
+      }
+      return
+    }
+    const preBuffer = this.config.preBufferSecs ?? DEFAULT_PRE_BUFFER_SECS
+    const high = preBuffer * TTS_SAMPLE_RATE
+    const low = high * 0.3
+    const buffered = this.samplesSent - this.getPlayedSecs() * TTS_SAMPLE_RATE
+
+    /* 流已全部喂入 rbuf: 剩余音频直接播完, 不再按水位线 suspend/等待
+     * (后面没有新内容, 等或 suspend 都会卡死尾部)。 */
+    if (this.allFed) {
+      if (!this.startedPlaying) {
+        /* seek 到尾部: 剩余 < high 也直接开播 */
+        await this.audioContext.resume()
+        this.connectWorklet()
+        this.totalPlayed = 0
+        this.lastResumeTime = this.audioContext.currentTime
+        this.playStartTime = this.audioContext.currentTime
+        this.startedPlaying = true
+        this.setState('playing')
+        this.emitProgress()
+        return
+      }
+      if (this.audioContext.state !== 'running') {
+        await this.audioContext.resume()
+        this.connectWorklet()
+        this.lastResumeTime = this.audioContext.currentTime
+      }
+      if (this.state === 'buffering') {
+        this.setState('playing')
+        this.emitProgress()
+      }
+      return
+    }
+
+    if (!this.startedPlaying) {
+      if (buffered < high) return
+      await this.audioContext.resume()
+      this.connectWorklet()
+      this.totalPlayed = 0
+      this.lastResumeTime = this.audioContext.currentTime
+      this.playStartTime = this.audioContext.currentTime
+      this.startedPlaying = true
+      this.setState('playing')
+      this.emitProgress()
+      return
+    }
+
+    if (this.state === 'playing' && buffered < low) {
+      this.totalPlayed = this.getPlayedSecs()
+      await this.audioContext.suspend()
+      this.setState('buffering')
+      this.emitProgress()
+    } else if (this.state === 'buffering' && buffered >= high) {
+      this.totalPlayed = this.getPlayedSecs()
+      await this.audioContext.resume()
+      this.connectWorklet()
+      this.lastResumeTime = this.audioContext.currentTime
+      this.setState('playing')
+      this.emitProgress()
+    }
+  }
+
+  /** 把 worklet 接回 destination (pause 断连后需要重连; 幂等)。 */
+  private connectWorklet(): void {
+    if (this.workletConnected) return
+    if (!this.workletNode || !this.audioContext) return
     this.workletNode.connect(this.audioContext.destination)
-    this.totalPlayed = 0
-    this.lastResumeTime = this.audioContext.currentTime
-    this.playStartTime = this.audioContext.currentTime
-    this.startedPlaying = true
-    this.setState('playing')
-    this.emitProgress()
-    if (this.bufferTimer) clearInterval(this.bufferTimer)
-    this.bufferTimer = setInterval(() => {
-      this.checkBuffer()
-    }, 500)
+    this.workletConnected = true
   }
 
   /** 正确计算已播放秒数 (跨 suspend/resume 不丢失)。 */
   private getPlayedSecs(): number {
     if (!this.audioContext || !this.startedPlaying) return 0
+    /* 暂停期间永远冻结 — 不信任 currentTime/state
+     * (浏览器长时间挂起后可能自动恢复时钟, 高亮会漂)。 */
+    if (this.userPaused) return this.totalPlayed
     if (this.audioContext.state === 'running') {
       return (
         this.totalPlayed + (this.audioContext.currentTime - this.lastResumeTime)
       )
     }
     return this.totalPlayed
-  }
-
-  /** Underrun 检测: buffer 不足 suspend, 恢复后 resume。 */
-  private async checkBuffer(): Promise<void> {
-    if (!this.audioContext || !this.startedPlaying || this.userPaused) return
-    const preBufferTarget = this.config.preBufferSecs ?? 3
-    const played = this.getPlayedSecs()
-    const buffered = this.samplesSent / TTS_SAMPLE_RATE - played
-    /* buffer < target*0.3 才 suspend */
-    if (this.state === 'playing' && buffered < preBufferTarget * 0.3) {
-      this.totalPlayed = played
-      await this.audioContext.suspend()
-      this.setState('buffering')
-      this.emitProgress()
-    } else if (this.state === 'buffering' && buffered >= preBufferTarget) {
-      this.totalPlayed = played
-      await this.audioContext.resume()
-      this.lastResumeTime = this.audioContext.currentTime
-      this.setState('playing')
-      this.emitProgress()
-    }
   }
 
   private emitProgress(): void {
@@ -831,7 +946,7 @@ export class TTSPlayer {
       playedSecs: played,
       bufferedSecs: Math.max(0, buffered - played),
       totalEstimate: this.currentText.length / 4,
-      preBufferTarget: this.config.preBufferSecs ?? 3,
+      preBufferTarget: this.config.preBufferSecs ?? DEFAULT_PRE_BUFFER_SECS,
       phase:
         this.state === 'loading' || this.state === 'buffering'
           ? 'buffering'
@@ -840,22 +955,42 @@ export class TTSPlayer {
           : 'paused',
       sentenceIndex: curIdx,
       sentenceTotal: this.sentences.length,
+      normalizedCount: this.normalizeCache.size,
+      synthesizedCount: this.nextTtsIndex,
     })
   }
 
   pause(): void {
     if (this.state !== 'playing') return
-    this.userPaused = true
+    /* 先冻结播放秒数再设 userPaused — getPlayedSecs 在 userPaused 时返回 totalPlayed,
+     * 若先设标志, 第一次暂停会取到旧值 0, 高亮跳回第一句。 */
     this.totalPlayed = this.getPlayedSecs()
-    this.audioContext?.suspend()
+    this.userPaused = true
+    /* 物理断连: 即使浏览器长时间挂起后自动恢复 AudioContext,
+     * 输出也无处可去 — 暂停期间不可能有声音。 */
+    if (this.workletNode && this.workletConnected) {
+      try {
+        this.workletNode.disconnect()
+      } catch (_) {
+        /* noop */
+      }
+      this.workletConnected = false
+    }
+    void this.audioContext?.suspend()
     this.setState('paused')
   }
   resume(): void {
     if (this.state !== 'paused') return
     this.userPaused = false
-    this.audioContext?.resume()
-    this.lastResumeTime = this.audioContext?.currentTime ?? 0
-    this.setState('playing')
+    /* 用户主动恢复立即生效: rbuf 里还有暂停时的数据, 不等高水位。
+     * resume 完成后校准时钟; 若之后真实缓冲不足, 状态机会自然 suspend。 */
+    this.connectWorklet()
+    void this.audioContext?.resume().then(() => {
+      if (!this.audioContext) return
+      this.lastResumeTime = this.audioContext.currentTime
+      this.setState('playing')
+      this.emitProgress()
+    })
   }
   togglePause(): void {
     if (this.state === 'playing') this.pause()
@@ -889,6 +1024,7 @@ export class TTSPlayer {
         /* noop */
       }
       this.workletNode = null
+      this.workletConnected = false
     }
     if (this.audioContext) {
       this.audioContext.close().catch(() => {})

@@ -14,6 +14,7 @@ import {
   loadTTSConfig,
   saveTTSConfig,
   fetchTTSConfig,
+  DEFAULT_PRE_BUFFER_SECS,
   type TTSState,
   type TTSConfig,
   type RemoteVoice,
@@ -577,9 +578,8 @@ async function initMarkdownPage(
         if (el) {
           el.style.display = state !== 'idle' ? '' : 'none'
         }
-        if (state === 'idle') {
-          unwrapSentences(mdContent.ele)
-        }
+        /* 播放结束/停止后保留句子包裹 — 用户随时可以点击任意句子重新播放。
+         * 只有换新文本 (onSentences) 时 wrapSentences 内部才会先 unwrap。 */
       },
       onError: msg => {
         console.error('TTS error:', msg)
@@ -597,6 +597,8 @@ async function initMarkdownPage(
       onProgress: (p: PlaybackProgress) => {
         const el = document.getElementById('md-reader__tts-progress')
         if (!el) return
+        /* 流水线进度: 归一化 N 句 / 合成 M 句 (两条独立产线)。 */
+        const pipeline = `归一化 ${p.normalizedCount}/${p.sentenceTotal}句 · 合成 ${p.synthesizedCount}/${p.sentenceTotal}句`
         if (p.phase === 'buffering') {
           const bufPct = Math.min(
             100,
@@ -606,11 +608,14 @@ async function initMarkdownPage(
             p,
           )} Buffering ${bufPct}% (${p.bufferedSecs.toFixed(0)}s / ${
             p.preBufferTarget
-          }s)`
+          }s) | ${pipeline}`
         } else if (p.playedSecs > 0 || p.sentenceTotal > 0) {
           el.textContent = `🔊 ${formatSentence(p)}  ${formatTime(
             p.playedSecs,
-          )} / ~${formatTime(p.totalEstimate)} | ${p.text.slice(0, 30)}...`
+          )} / ~${formatTime(p.totalEstimate)} | ${p.text.slice(
+            0,
+            30,
+          )}... | ${pipeline}`
         }
       },
     },
@@ -869,7 +874,7 @@ async function initMarkdownPage(
     const modelVal = saved.model || ''
     const voiceVal = saved.voice || ''
     const speedVal = saved.speed ?? 1
-    const preBufVal = saved.preBufferSecs ?? 30
+    const preBufVal = saved.preBufferSecs ?? DEFAULT_PRE_BUFFER_SECS
 
     /* Build model <option>s */
     const modelOptions = serverModels

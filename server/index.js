@@ -231,6 +231,44 @@ app.post('/api/tts/normalize', express.json({ limit: '2mb' }), (req, res) =>
   forwardTtsEndpoint(req, res, 'normalize'),
 )
 
+/* normalize-batch: 一次请求归一化多句 (后端 gather 并发)。
+ * 结果顺序与输入一致, 单项失败降级原文。 */
+app.post(
+  '/api/tts/normalize-batch',
+  express.json({ limit: '5mb' }),
+  async (req, res) => {
+    const { sentences, apiUrl, apiKey } = req.body || {}
+    if (!Array.isArray(sentences) || !sentences.length) {
+      return res.status(400).json({ error: 'sentences array is required' })
+    }
+    const base = deriveTtsBase(apiUrl)
+    const key = apiKey || TTS_API_KEY
+    if (!base || !key) {
+      return res.status(503).json({
+        error:
+          'TTS normalize-batch endpoint not configured (set apiUrl/apiKey in Settings, or TTS_API_URL/TTS_API_KEY on the server).',
+      })
+    }
+    try {
+      const upstream = await fetch(base + '/api/v1/tts/normalize-batch', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ sentences, language: 'chinese' }),
+      })
+      const data = await upstream.json()
+      if (!upstream.ok) return res.status(upstream.status).json(data)
+      return res.json(data)
+    } catch (e) {
+      return res
+        .status(502)
+        .json({ error: 'normalize-batch upstream unreachable: ' + e.message })
+    }
+  },
+)
+
 app.post('/api/tts', express.json({ limit: '2mb' }), async (req, res) => {
   const { text, voice, speed, apiUrl, apiKey, model } = req.body || {}
 
