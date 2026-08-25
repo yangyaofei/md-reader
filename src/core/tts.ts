@@ -427,8 +427,8 @@ export class TTSPlayer {
   }
 
   /**
-   * 预加载: split + normalize 预取 (不做 TTS PCM —— 省带宽)。
-   * 页面渲染后立即调用, 用户点击播放时 normalize 已 ready, 首句只需 TTS。
+   * 预加载: 只 split + 包裹 DOM (不做 normalize — 用户不点播放就不浪费 LLM API)。
+   * 页面渲染后立即调用, 点播放时才启动 normalize 预取 (play → playFrom → ensureNormalize)。
    */
   preload(text: string): void {
     if (!text.trim()) return
@@ -436,9 +436,6 @@ export class TTSPlayer {
     this.preloadPromise = splitText(text, this.config)
       .then(sentences => {
         this.sentences = sentences
-        /* 后台预取 normalize (前 N 句) */
-        if (!this.masterAbort) this.masterAbort = new AbortController()
-        this.ensureNormalize()
         /* 立即包裹 DOM — 用户进页面就能看到句子结构 + 点击 seek */
         this.callbacks.onSentences?.(sentences)
         return sentences
