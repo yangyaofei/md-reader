@@ -177,45 +177,86 @@ app.get('/api/tts/config', async (req, res) => {
   }
 })
 
-/* Segment + normalize proxy.  Forwards to edge-tts /api/v1/tts/segment.
- * Path derivation: audio/speech (openai router, no prefix) -> /v1/audio/speech;
- * segment (tts router, prefix /api/v1) -> /api/v1/tts/segment.  Both share the
- * same tunnel base, so strip the audio/speech suffix and append the segment path. */
+/* split + normalize proxy. 三步正交流程的前两步 (edge-tts):
+ *   /api/tts/split     → 分句 (纯正则, 无归一化)
+ *   /api/tts/normalize → 单句归一化 (pydantic-ai, LLM)
+ * 第三步 /api/tts (audio/speech) 是纯 TTS, 不重复归一化。
+ * Path: audio/speech 在 openai router (无 prefix); tts endpoints 在 /api/v1/tts。 */
+function deriveTtsBase(apiUrl) {
+  return (apiUrl || TTS_API_URL || '').replace(/\/v1\/audio\/speech\/?$/, '')
+}
+
+async function forwardTtsEndpoint(req, res, name) {
+  const { text, apiUrl, apiKey } = req.body || {}
+  if (text == null || typeof text !== 'string') {
+    return res.status(400).json({ error: 'text is required' })
+  }
+  if (text.trim() === '') {
+    return res.json(name === 'split' ? { sentences: [] } : { tts_text: '' })
+  }
+  const base = deriveTtsBase(apiUrl)
+  const url = base + '/api/v1/tts/' + name
+  const key = apiKey || TTS_API_KEY
+  if (!base || !key) {
+    return res.status(503).json({
+      error:
+        'TTS ' +
+        name +
+        ' endpoint not configured (set apiUrl/apiKey in Settings, or TTS_API_URL/TTS_API_KEY on the server).',
+    })
+  }
+  try {
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    })
+    const data = await upstream.json()
+    if (!upstream.ok) return res.status(upstream.status).json(data)
+    return res.json(data)
+  } catch (e) {
+    return res
+      .status(502)
+      .json({ error: name + ' upstream unreachable: ' + e.message })
+  }
+}
+
+app.post('/api/tts/split', express.json({ limit: '2mb' }), (req, res) =>
+  forwardTtsEndpoint(req, res, 'split'),
+)
+app.post('/api/tts/normalize', express.json({ limit: '2mb' }), (req, res) =>
+  forwardTtsEndpoint(req, res, 'normalize'),
+)
+
+/* normalize-batch: 一次请求归一化多句 (后端 gather 并发)。
+ * 结果顺序与输入一致, 单项失败降级原文。 */
 app.post(
-  '/api/tts/segment',
-  express.json({ limit: '2mb' }),
+  '/api/tts/normalize-batch',
+  express.json({ limit: '5mb' }),
   async (req, res) => {
-    const { text, language, normalize, apiUrl, apiKey } = req.body || {}
-    if (text == null || typeof text !== 'string') {
-      return res.status(400).json({ error: 'text is required' })
+    const { sentences, apiUrl, apiKey } = req.body || {}
+    if (!Array.isArray(sentences) || !sentences.length) {
+      return res.status(400).json({ error: 'sentences array is required' })
     }
-    if (text.trim() === '') {
-      return res.json({ sentences: [] })
-    }
-    const base = (apiUrl || TTS_API_URL || '').replace(
-      /\/v1\/audio\/speech\/?$/,
-      '',
-    )
-    const segUrl = base + '/api/v1/tts/segment'
+    const base = deriveTtsBase(apiUrl)
     const key = apiKey || TTS_API_KEY
     if (!base || !key) {
       return res.status(503).json({
         error:
-          'TTS segment endpoint not configured (set apiUrl/apiKey in Settings, or TTS_API_URL/TTS_API_KEY on the server).',
+          'TTS normalize-batch endpoint not configured (set apiUrl/apiKey in Settings, or TTS_API_URL/TTS_API_KEY on the server).',
       })
     }
     try {
-      const upstream = await fetch(segUrl, {
+      const upstream = await fetch(base + '/api/v1/tts/normalize-batch', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${key}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          text,
-          language: language || 'chinese',
-          normalize: normalize || 'llm',
-        }),
+        body: JSON.stringify({ sentences, language: 'chinese' }),
       })
       const data = await upstream.json()
       if (!upstream.ok) return res.status(upstream.status).json(data)
@@ -223,7 +264,7 @@ app.post(
     } catch (e) {
       return res
         .status(502)
-        .json({ error: 'segment upstream unreachable: ' + e.message })
+        .json({ error: 'normalize-batch upstream unreachable: ' + e.message })
     }
   },
 )

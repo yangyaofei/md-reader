@@ -14,6 +14,7 @@ import {
   loadTTSConfig,
   saveTTSConfig,
   fetchTTSConfig,
+  DEFAULT_PRE_BUFFER_SECS,
   type TTSState,
   type TTSConfig,
   type RemoteVoice,
@@ -486,10 +487,18 @@ async function initMarkdownPage(
     title: 'Read aloud',
   })
   ttsBtn.innerHTML = SPEAKER_SVG
+  let selectedSentenceIdx = -1
   ttsBtn.on('click', async () => {
+    if (!mdRaw) return
     const text = extractTextForTTS(mdContent.ele)
-    if (!text) return
-    await ttsPlayer.play(text)
+    await ttsPlayer.play(
+      text,
+      selectedSentenceIdx >= 0 ? selectedSentenceIdx : undefined,
+    )
+    selectedSentenceIdx = -1
+    document
+      .querySelectorAll('.' + SENTENCE_SELECTED_CLS)
+      .forEach(el => el.classList.remove(SENTENCE_SELECTED_CLS))
   })
 
   const ttsPauseBtn = new Ele<HTMLElement>('button', {
@@ -537,13 +546,18 @@ async function initMarkdownPage(
             ttsStopBtn.show()
             break
           }
-          case 'buffering':
+          case 'buffering': {
+            const elb = document.getElementById('md-reader__tts-progress')
+            if (elb && elb.textContent?.indexOf('正在分析') >= 0) {
+              elb.textContent = '⏳ 正在合成语音...'
+            }
             ttsBtn.hide()
             ttsPauseBtn.show()
             ttsPauseBtn.innerHTML = PAUSE_SVG
             ttsPauseBtn.ele.title = 'Buffering...'
             ttsStopBtn.show()
             break
+          }
           case 'playing':
             ttsBtn.hide()
             ttsPauseBtn.show()
@@ -564,15 +578,18 @@ async function initMarkdownPage(
         if (el) {
           el.style.display = state !== 'idle' ? '' : 'none'
         }
-        if (state === 'idle') {
-          unwrapSentences(mdContent.ele)
-        }
+        /* 播放结束/停止后保留句子包裹 — 用户随时可以点击任意句子重新播放。
+         * 只有换新文本 (onSentences) 时 wrapSentences 内部才会先 unwrap。 */
       },
       onError: msg => {
         console.error('TTS error:', msg)
       },
       onSentences: (sentences: Sentence[]) => {
-        wrapSentences(mdContent.ele, sentences)
+        try {
+          wrapSentences(mdContent.ele, sentences)
+        } catch (e) {
+          console.error('[TTS] wrapSentences error:', e)
+        }
       },
       onSentenceChange: (idx: number) => {
         highlightSentence(idx)
@@ -580,6 +597,8 @@ async function initMarkdownPage(
       onProgress: (p: PlaybackProgress) => {
         const el = document.getElementById('md-reader__tts-progress')
         if (!el) return
+        /* 流水线进度: 归一化 N 句 / 合成 M 句 (两条独立产线)。 */
+        const pipeline = `归一化 ${p.normalizedCount}/${p.sentenceTotal}句 · 合成 ${p.synthesizedCount}/${p.sentenceTotal}句`
         if (p.phase === 'buffering') {
           const bufPct = Math.min(
             100,
@@ -589,11 +608,14 @@ async function initMarkdownPage(
             p,
           )} Buffering ${bufPct}% (${p.bufferedSecs.toFixed(0)}s / ${
             p.preBufferTarget
-          }s)`
+          }s) | ${pipeline}`
         } else if (p.playedSecs > 0 || p.sentenceTotal > 0) {
           el.textContent = `🔊 ${formatSentence(p)}  ${formatTime(
             p.playedSecs,
-          )} / ~${formatTime(p.totalEstimate)} | ${p.text.slice(0, 30)}...`
+          )} / ~${formatTime(p.totalEstimate)} | ${p.text.slice(
+            0,
+            30,
+          )}... | ${pipeline}`
         }
       },
     },
@@ -606,6 +628,12 @@ async function initMarkdownPage(
   progressEl.className = 'md-reader__tts-progress'
   progressEl.style.display = 'none'
   document.body.appendChild(progressEl)
+
+  /* ---- Preload: split + normalize on page load ----
+   * 用户打开页面就预取分句 + 归一化, 点击播放时数据已 ready, 首句只需 TTS。 */
+  if (mdRaw) {
+    ttsPlayer.preload(extractTextForTTS(mdContent.ele))
+  }
 
   function formatTime(s: number): string {
     if (s <= 0 || !isFinite(s)) return '0:00'
@@ -623,6 +651,7 @@ async function initMarkdownPage(
 
   /* ---- sentence DOM wrapping + highlight ---- */
   const SENTENCE_ACTIVE_CLS = className.TTS_SENTENCE + '--active'
+  const SENTENCE_SELECTED_CLS = className.TTS_SENTENCE + '--selected'
   const SENTENCE_SKIP =
     'pre, img, svg, table, .md-reader__head-anchor, .md-reader__btn--copy'
 
@@ -731,34 +760,44 @@ async function initMarkdownPage(
           count++
         }
       }
-      return null
+      /* offset is at or past the end of this text node (e.g. after a
+       * previous surroundContents split shortened the node) */
+      return { ni: idx, co: text.length }
     }
 
-    /* right-to-left so wrapping doesn't shift earlier node offsets */
+    /* right-to-left so wrapping doesn't shift earlier node offsets.
+     * Cross-node sentences are wrapped per-text-node (same data-idx)
+     * instead of extractContents which moves DOM nodes and breaks layout. */
     for (let i = sentences.length - 1; i >= 0; i--) {
       const s = locate(bounds[i].start)
       const e = locate(bounds[i].end)
       if (!s || !e) continue
-      const span = document.createElement('span')
-      span.className = className.TTS_SENTENCE
-      span.dataset.idx = String(i)
       try {
-        const range = document.createRange()
-        range.setStart(nodes[s.ni], s.co)
-        range.setEnd(nodes[e.ni], e.co)
-        try {
+        if (s.ni === e.ni) {
+          const span = document.createElement('span')
+          span.className = className.TTS_SENTENCE
+          span.dataset.idx = String(i)
+          const range = document.createRange()
+          range.setStart(nodes[s.ni], s.co)
+          range.setEnd(nodes[e.ni], e.co)
           range.surroundContents(span)
-        } catch (_) {
-          /* surroundContents rejects partially-contained nodes; fall back
-           * to extract+insert which handles cross-node ranges. */
-          const r2 = document.createRange()
-          r2.setStart(nodes[s.ni], s.co)
-          r2.setEnd(nodes[e.ni], e.co)
-          const contents = r2.extractContents()
-          span.appendChild(contents)
-          r2.insertNode(span)
+        } else {
+          for (let ni = e.ni; ni >= s.ni; ni--) {
+            const node = nodes[ni]
+            const text = node.nodeValue || ''
+            const startCo = ni === s.ni ? s.co : 0
+            const endCo = ni === e.ni ? e.co : text.length
+            if (startCo >= endCo) continue
+            const span = document.createElement('span')
+            span.className = className.TTS_SENTENCE
+            span.dataset.idx = String(i)
+            const range = document.createRange()
+            range.setStart(node, startCo)
+            range.setEnd(node, endCo)
+            range.surroundContents(span)
+          }
         }
-      } catch (_) {
+      } catch (e) {
         /* skip this sentence on any failure */
       }
     }
@@ -766,27 +805,37 @@ async function initMarkdownPage(
 
   function highlightSentence(idx: number) {
     const root = mdContent.ele
-    const prev = root.querySelector('.' + SENTENCE_ACTIVE_CLS)
-    if (prev) prev.classList.remove(SENTENCE_ACTIVE_CLS)
-    const target = root.querySelector(
+    root
+      .querySelectorAll('.' + SENTENCE_ACTIVE_CLS)
+      .forEach(el => el.classList.remove(SENTENCE_ACTIVE_CLS))
+    const targets = root.querySelectorAll(
       `.${className.TTS_SENTENCE}[data-idx="${idx}"]`,
     )
-    if (target) {
-      target.classList.add(SENTENCE_ACTIVE_CLS)
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (targets.length) {
+      targets.forEach(t => t.classList.add(SENTENCE_ACTIVE_CLS))
+      targets[0].scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
   }
 
-  /* click any sentence span to seek playback */
+  /* click sentence span → select (highlight), not seek. Play button starts from selection. */
   mdContent.ele.addEventListener('click', (ev: MouseEvent) => {
     const tgt = (ev.target as HTMLElement).closest(
       '.' + className.TTS_SENTENCE,
     ) as HTMLElement | null
     if (!tgt) return
     const idx = parseInt(tgt.dataset.idx || '', 10)
-    if (!isNaN(idx)) {
-      ev.preventDefault()
-      ttsPlayer.seekTo(idx)
+    if (isNaN(idx)) return
+    ev.preventDefault()
+    /* toggle selection */
+    if (selectedSentenceIdx === idx) {
+      selectedSentenceIdx = -1
+      tgt.classList.remove(SENTENCE_SELECTED_CLS)
+    } else {
+      selectedSentenceIdx = idx
+      document
+        .querySelectorAll('.' + SENTENCE_SELECTED_CLS)
+        .forEach(el => el.classList.remove(SENTENCE_SELECTED_CLS))
+      tgt.classList.add(SENTENCE_SELECTED_CLS)
     }
   })
 
@@ -825,7 +874,7 @@ async function initMarkdownPage(
     const modelVal = saved.model || ''
     const voiceVal = saved.voice || ''
     const speedVal = saved.speed ?? 1
-    const preBufVal = saved.preBufferSecs ?? 30
+    const preBufVal = saved.preBufferSecs ?? DEFAULT_PRE_BUFFER_SECS
 
     /* Build model <option>s */
     const modelOptions = serverModels
